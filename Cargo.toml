@@ -19,3 +19,6 @@ unsafe_op_in_unsafe_fn = "deny"
 all = "deny"
 pedantic = "deny"
 nursery = "deny"
+
+[dev-dependencies]
+proptest = "1.10.0"
