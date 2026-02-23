@@ -197,6 +197,55 @@ impl<T> Arena<T> {
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.items.iter()
     }
+
+    /// Allocates multiple values from an iterator, returning the index
+    /// of the first allocated item.
+    ///
+    /// Returns `None` if the iterator is empty.
+    ///
+    /// O(n) where n = items yielded by the iterator.
+    pub fn alloc_extend(&mut self, iter: impl IntoIterator<Item = T>) -> Option<Idx<T>> {
+        let start = self.items.len();
+        self.items.extend(iter);
+        if self.items.len() > start {
+            Some(Idx {
+                index: start,
+                _marker: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if `idx` points to a valid item in this arena.
+    ///
+    /// An index becomes invalid after [`rollback`](Arena::rollback) or
+    /// [`reset`](Arena::reset) removes the item it pointed to.
+    #[must_use]
+    pub const fn is_valid(&self, idx: Idx<T>) -> bool {
+        idx.index < self.items.len()
+    }
+
+    /// Returns a reference to the value at `idx`, or `None` if the
+    /// index is out of bounds.
+    #[must_use]
+    pub fn try_get(&self, idx: Idx<T>) -> Option<&T> {
+        self.items.get(idx.index)
+    }
+
+    /// Returns a mutable reference to the value at `idx`, or `None`
+    /// if the index is out of bounds.
+    #[must_use]
+    pub fn try_get_mut(&mut self, idx: Idx<T>) -> Option<&mut T> {
+        self.items.get_mut(idx.index)
+    }
+
+    /// Removes all items and returns them as a [`Vec<T>`].
+    ///
+    /// The arena is empty after this call. Capacity is retained.
+    pub fn drain(&mut self) -> Vec<T> {
+        self.items.drain(..).collect()
+    }
 }
 
 impl<T> Default for Arena<T> {
@@ -225,6 +274,15 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<T> IntoIterator for Arena<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
     }
 }
 
@@ -577,5 +635,118 @@ mod tests {
         let a = arena.alloc(String::from("second"));
         assert_eq!(arena[a], "second");
         assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn alloc_extend_returns_first_idx() {
+        let mut arena = Arena::new();
+        arena.alloc(0);
+
+        let first = arena.alloc_extend(vec![10, 20, 30]);
+        assert_eq!(first, Some(Idx::from_raw(1)));
+        assert_eq!(arena.len(), 4);
+        assert_eq!(arena[Idx::from_raw(1)], 10);
+        assert_eq!(arena[Idx::from_raw(2)], 20);
+        assert_eq!(arena[Idx::from_raw(3)], 30);
+    }
+
+    #[test]
+    fn alloc_extend_empty_returns_none() {
+        let mut arena: Arena<i32> = Arena::new();
+        let result = arena.alloc_extend(std::iter::empty());
+        assert_eq!(result, None);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn is_valid_after_rollback() {
+        let mut arena = Arena::new();
+        let a = arena.alloc(1);
+        let cp = arena.checkpoint();
+        let b = arena.alloc(2);
+
+        assert!(arena.is_valid(a));
+        assert!(arena.is_valid(b));
+
+        arena.rollback(cp);
+        assert!(arena.is_valid(a));
+        assert!(!arena.is_valid(b));
+    }
+
+    #[test]
+    fn is_valid_after_reset() {
+        let mut arena = Arena::new();
+        let a = arena.alloc(1);
+
+        assert!(arena.is_valid(a));
+        arena.reset();
+        assert!(!arena.is_valid(a));
+    }
+
+    #[test]
+    fn try_get_returns_none_for_stale() {
+        let mut arena = Arena::new();
+        let a = arena.alloc(42);
+        let cp = arena.checkpoint();
+        let b = arena.alloc(99);
+
+        arena.rollback(cp);
+        assert_eq!(arena.try_get(a), Some(&42));
+        assert_eq!(arena.try_get(b), None);
+    }
+
+    #[test]
+    fn try_get_mut_returns_none_for_stale() {
+        let mut arena = Arena::new();
+        let _a = arena.alloc(1);
+        let cp = arena.checkpoint();
+        let b = arena.alloc(2);
+
+        arena.rollback(cp);
+        assert_eq!(arena.try_get_mut(b), None);
+    }
+
+    #[test]
+    fn drain_returns_all_items() {
+        let mut arena = Arena::new();
+        arena.alloc(10);
+        arena.alloc(20);
+        arena.alloc(30);
+
+        let items = arena.drain();
+        assert_eq!(items, vec![10, 20, 30]);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn drain_runs_no_extra_drops() {
+        let drop_count = Rc::new(Cell::new(0u32));
+
+        struct Tracked(Rc<Cell<u32>>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let mut arena = Arena::new();
+        arena.alloc(Tracked(Rc::clone(&drop_count)));
+        arena.alloc(Tracked(Rc::clone(&drop_count)));
+
+        let items = arena.drain();
+        assert_eq!(drop_count.get(), 0); // not dropped yet — owned by items
+        drop(items);
+        assert_eq!(drop_count.get(), 2); // now dropped
+    }
+
+    #[test]
+    fn into_iter_consuming() {
+        let mut arena = Arena::new();
+        arena.alloc(String::from("a"));
+        arena.alloc(String::from("b"));
+        arena.alloc(String::from("c"));
+
+        let collected: Vec<String> = arena.into_iter().collect();
+        assert_eq!(collected, vec!["a", "b", "c"]);
     }
 }
