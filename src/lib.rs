@@ -1035,6 +1035,45 @@ mod tests {
     }
 
     #[test]
+    fn drop_arena_runs_drop() {
+        let drop_count = Rc::new(Cell::new(0u32));
+
+        struct Tracked(Rc<Cell<u32>>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        {
+            let mut arena = Arena::new();
+            arena.alloc(Tracked(Rc::clone(&drop_count)));
+            arena.alloc(Tracked(Rc::clone(&drop_count)));
+            arena.alloc(Tracked(Rc::clone(&drop_count)));
+            assert_eq!(drop_count.get(), 0);
+        } // arena dropped here
+
+        assert_eq!(drop_count.get(), 3);
+    }
+
+    #[test]
+    fn checkpoint_keep() {
+        let mut arena = Arena::new();
+        let a = arena.alloc(1);
+        let _cp = arena.checkpoint();
+
+        // Allocate speculatively
+        let b = arena.alloc(2);
+        let c = arena.alloc(3);
+
+        // Decide to KEEP — simply don't rollback
+        assert_eq!(arena.len(), 3);
+        assert_eq!(arena[a], 1);
+        assert_eq!(arena[b], 2);
+        assert_eq!(arena[c], 3);
+    }
+
+    #[test]
     fn into_iter_consuming() {
         let mut arena = Arena::new();
         arena.alloc(String::from("a"));
