@@ -1,0 +1,8 @@
+safe-bump
+Copyright 2026 Yuriy Krasilnikov
+
+A safe bump-pointer arena allocator for Rust.
+Zero unsafe code. Auto Drop. Checkpoint/rollback.
+
+References:
+  Hanson, 1990 — "Fast Allocation and Deallocation of Memory Based on Object Lifetimes"
