@@ -1,6 +1,6 @@
 [package]
 name = "safe-bump"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Yuriy Krasilnikov <YuriyKrasilnikov@users.noreply.github.com>"]
 edition = "2024"
 rust-version = "1.93"
@@ -9,7 +9,7 @@ repository = "https://github.com/YuriyKrasilnikov/safe-bump"
 homepage = "https://github.com/YuriyKrasilnikov/safe-bump"
 documentation = "https://docs.rs/safe-bump"
 readme = "README.md"
-description = "Safe bump-pointer arena allocator — zero unsafe, auto Drop, checkpoint/rollback"
+description = "Safe bump-pointer arena allocator — zero unsafe, auto Drop, checkpoint/rollback, thread-safe"
 categories = ["memory-management", "data-structures"]
 keywords = ["arena", "allocator", "bump", "memory", "safe"]
 [lints.rust]
