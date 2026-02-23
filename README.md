@@ -2,7 +2,7 @@
 
 Safe bump-pointer arena allocator for Rust.
 
-**Zero `unsafe`. Auto `Drop`. Checkpoint/rollback.**
+**Zero `unsafe`. Auto `Drop`. Checkpoint/rollback. Thread-safe.**
 
 ## Why safe-bump?
 
@@ -12,21 +12,18 @@ Safe bump-pointer arena allocator for Rust.
 | `#![forbid(unsafe_code)]` | **yes** | no | no | no |
 | Auto `Drop` | **yes** | no | yes | yes |
 | Checkpoint/rollback | **yes** | no | no | scopes only |
-| Reset with reuse | **yes** | yes | no | yes |
-| Access pattern | index `Idx<T>` | reference `&T` | reference `&T` | `BumpBox<T>` |
 | Keep OR discard | **yes** | discard only | neither | discard only |
+| Thread-safe arena | **`SharedArena`** | no | no | no |
+| Access returns `&T` | **yes** | yes | yes | no (`BumpBox`) |
 
-Existing arena allocators (`bumpalo`, `typed-arena`, `bump-scope`) all rely on
-`unsafe` internally for pointer manipulation. `safe-bump` achieves the same
-arena semantics using only safe Rust: values are stored in a `Vec<T>` and
-accessed via typed `Idx<T>` handles.
+Existing arena allocators rely on `unsafe` internally for pointer manipulation.
+`safe-bump` achieves the same arena semantics using only safe Rust.
 
-The index-based design enables **checkpoint/rollback** — save allocation state,
-allocate speculatively, then either keep or discard. Discarding runs destructors
-for rolled-back values. This pattern is useful when mutations must be validated
-before committing — allocate tentatively, check invariants, then keep or roll back.
+## Two arena types
 
-## Usage
+### `Arena<T>` — single-thread, zero overhead
+
+Backed by `Vec<T>`. Minimal overhead, cache-friendly linear layout.
 
 ```rust
 use safe_bump::{Arena, Idx};
@@ -45,54 +42,133 @@ assert_eq!(arena.len(), 3);
 
 arena.rollback(cp); // "temporary" is dropped
 assert_eq!(arena.len(), 2);
-
-// Reset reuses memory
-arena.reset();
-assert_eq!(arena.len(), 0);
 ```
+
+### `SharedArena<T>` — multi-thread, `Send + Sync`
+
+Concurrent allocation via `&self`. Wait-free reads. Same `Idx<T>` handles,
+same `&T` access, same checkpoint/rollback semantics.
+
+```rust
+use safe_bump::{SharedArena, Idx};
+use std::sync::Arc;
+use std::thread;
+
+let arena = Arc::new(SharedArena::<u64>::new());
+
+let handles: Vec<_> = (0..4).map(|i| {
+    let arena = Arc::clone(&arena);
+    thread::spawn(move || arena.alloc(i))
+}).collect();
+
+let indices: Vec<Idx<u64>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+// All values accessible via &T — no guards, no locks
+for idx in &indices {
+    let _val: &u64 = arena.get(*idx);
+}
+```
+
+### Comparison
+
+| Operation | `Arena<T>` | `SharedArena<T>` |
+|---|---|---|
+| `alloc` | `&mut self`, O(1) | `&self`, O(1) |
+| `get` / `try_get` | `&self` → `&T` | `&self` → `&T`, wait-free |
+| `get_mut` / `try_get_mut` | `&mut self` → `&mut T` | — |
+| `checkpoint` | `&self` | `&self` |
+| `rollback` / `reset` | `&mut self` | `&mut self` |
+| `iter` / `iter_indexed` | `&self` | `&self` |
+| `iter_mut` / `iter_indexed_mut` | `&mut self` | — |
+| `drain` / `into_iter` | `&mut self` / `self` | `&mut self` / `self` |
+| `alloc_extend` | `&mut self` | `&self` |
+| `Extend` / `FromIterator` | yes | yes |
+| Capacity (`with_capacity`, `reserve`, `shrink_to_fit`) | yes | — |
+| **Memory per slot** | **`size_of::<T>()`** | **`size_of::<T>()` + ~8 bytes** |
+| **Cache behavior** | **linear scan friendly** | **chunked (pointer chase)** |
+| **Threading** | `Send` | **`Send + Sync`** |
+| Unsafe | none | none |
+
+### When to use which
+
+**`Arena<T>`** — default choice for single-thread workloads:
+- Backed by `Vec<T>`: one contiguous allocation, cache-friendly sequential access
+- `alloc` is a single `Vec::push` — no atomic operations
+- `get` is a direct array index — one memory access
+- Supports `IndexMut`, `iter_mut`, `Extend`, `FromIterator`
+
+**`SharedArena<T>`** — when multiple threads allocate concurrently:
+- `alloc(&self)` can be called from any thread without `&mut`
+- `get` returns `&T` directly (no `MutexGuard`, no `RwLockReadGuard`)
+- Reads are wait-free: never blocked by concurrent writers
+
+**The tradeoff:**
+
+| | `Arena<T>` | `SharedArena<T>` |
+|---|---|---|
+| `get` latency | ~1 ns (direct index) | ~5-10 ns (two pointer chases) |
+| `alloc` latency | ~5 ns (Vec::push) | ~10-20 ns (atomics + OnceLock) |
+| Memory per slot | `size_of::<T>()` | `size_of::<T>()` + ~8 bytes |
+| Empty arena | 0 bytes | ~512 bytes |
+| Cache behavior | linear scan friendly | scattered across heap |
+| Mutable access | `get_mut`, `IndexMut` | not available |
+
+The overhead comes from the fundamental requirement: returning `&T` from
+concurrent storage without locks requires indirection. Each slot is an
+`OnceLock<T>` inside a chunked layout where elements never move — this
+adds a pointer chase per access and ~8 bytes per slot for the `OnceLock`
+bookkeeping.
+
+If your code is single-threaded, always prefer `Arena<T>` — there is no
+reason to pay for synchronization you don't use.
 
 ## Design
 
-`Arena<T>` is a typed, append-only allocator backed by `Vec<T>`.
-`Idx<T>` is a stable, `Copy` index into the arena.
-`Checkpoint<T>` captures allocation state for rollback.
+`Idx<T>` is a stable, `Copy` index valid for the lifetime of the arena
+(invalidated by rollback/reset past its allocation point).
+
+`Checkpoint<T>` captures allocation state. Rolling back drops all values
+allocated after the checkpoint and reclaims their slots.
+
+Both arena types share the same `Idx<T>` and `Checkpoint<T>` types.
 
 ### Complexity
 
-| Operation | Time | Notes |
-|-----------|------|-------|
-| `alloc` | O(1) amortized | `Vec::push` |
-| `get` / `Index` | O(1) | direct index |
-| `alloc_extend` | O(n) | n = items from iterator |
-| `checkpoint` | O(1) | saves current length |
-| `rollback` | O(k) | k = items dropped (destructors run) |
-| `reset` | O(n) | n = all items (destructors run) |
-| `drain` | O(n) | returns owning iterator |
-| `reserve` | O(1) amortized | delegates to `Vec::reserve` |
+| Operation | `Arena<T>` | `SharedArena<T>` |
+|-----------|-----------|-----------------|
+| `alloc` | O(1) amortized | O(1) |
+| `get` / `Index` | O(1) | O(1) wait-free |
+| `checkpoint` | O(1) | O(1) |
+| `rollback` | O(k) | O(k) |
+| `reset` | O(n) | O(n) |
+| `alloc_extend` | O(n) | O(n) |
+| `drain` | O(n) | O(n) |
+
+k = items dropped (destructors run), n = all items.
 
 ### Standard traits
 
-`Arena<T>` implements `Index<Idx<T>>`, `IndexMut<Idx<T>>`, `IntoIterator`
-(shared, mutable, and consuming), `Extend<T>`, `FromIterator<T>`, and `Default`.
+`Arena<T>`: `Index`, `IndexMut`, `IntoIterator`, `Extend`, `FromIterator`, `Default`.
 
-`Idx<T>` implements `Copy`, `Eq`, `Ord`, `Hash`, and `Debug`.
+`SharedArena<T>`: `Index`, `IntoIterator`, `Extend`, `FromIterator`, `Default`, `Send + Sync`.
 
-`Checkpoint<T>` implements `Copy`, `Eq`, `Ord`, `Hash`, and `Debug`.
+`Idx<T>`: `Copy`, `Eq`, `Ord`, `Hash`, `Debug`.
+
+`Checkpoint<T>`: `Copy`, `Eq`, `Ord`, `Hash`, `Debug`.
 
 ## Limitations
 
-- **Typed**: each `Arena<T>` stores a single type. Use separate arenas for
+- **Typed**: each arena stores a single type `T`. Use separate arenas for
   different types.
 - **Append-only**: individual items cannot be removed. Use `rollback` to
   discard a suffix or `reset` to clear everything.
-- **No cross-arena safety**: `Idx<T>` is a plain `usize` wrapper — it does
-  not carry an arena identifier. An index from one arena can be accidentally
-  used on another arena of the same type (panic on out-of-bounds, silent
-  wrong data if in-bounds). This is a deliberate tradeoff: keeping `Idx` at
-  one machine word (8 bytes, `Copy`) minimizes storage overhead in data
-  structures that hold many indices, and eliminates per-access arena-id
-  checks on the hot path. The same approach is used by `typed-arena` (bare
-  references), `slotmap` (keys without container id), and ECS libraries.
+- **`SharedArena` overhead**: ~8 bytes per slot and chunked storage layout
+  (reduced cache locality) compared to `Arena`.
+- **No cross-arena safety**: `Idx<T>` does not carry an arena identifier.
+  An index from one arena can be used on another arena of the same type
+  (panic on out-of-bounds, wrong data if in-bounds). This is a deliberate
+  tradeoff: keeping `Idx` at one machine word minimizes storage overhead and
+  eliminates per-access checks on the hot path.
 
 ## References
 
