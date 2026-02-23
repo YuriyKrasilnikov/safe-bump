@@ -246,6 +246,19 @@ impl<T> Arena<T> {
     pub fn drain(&mut self) -> Vec<T> {
         self.items.drain(..).collect()
     }
+
+    /// Returns an iterator yielding `(Idx<T>, &T)` pairs in allocation order.
+    #[must_use]
+    pub fn iter_indexed(&self) -> IterIndexed<'_, T> {
+        IterIndexed {
+            inner: self.items.iter().enumerate(),
+        }
+    }
+
+    /// Shrinks the backing storage to fit the current number of items.
+    pub fn shrink_to_fit(&mut self) {
+        self.items.shrink_to_fit();
+    }
 }
 
 impl<T> Default for Arena<T> {
@@ -285,6 +298,37 @@ impl<T> IntoIterator for Arena<T> {
         self.items.into_iter()
     }
 }
+
+// ─── IterIndexed ─────────────────────────────────────────────────────────────
+
+/// Iterator yielding `(Idx<T>, &T)` pairs in allocation order.
+///
+/// Created by [`Arena::iter_indexed`].
+pub struct IterIndexed<'a, T> {
+    inner: std::iter::Enumerate<std::slice::Iter<'a, T>>,
+}
+
+impl<'a, T> Iterator for IterIndexed<'a, T> {
+    type Item = (Idx<T>, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(i, v)| {
+            (
+                Idx {
+                    index: i,
+                    _marker: PhantomData,
+                },
+                v,
+            )
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for IterIndexed<'_, T> {}
 
 // ─── Idx ─────────────────────────────────────────────────────────────────────
 
@@ -737,6 +781,49 @@ mod tests {
         assert_eq!(drop_count.get(), 0); // not dropped yet — owned by items
         drop(items);
         assert_eq!(drop_count.get(), 2); // now dropped
+    }
+
+    #[test]
+    fn iter_indexed_yields_correct_pairs() {
+        let mut arena = Arena::new();
+        let a = arena.alloc("x");
+        let b = arena.alloc("y");
+        let c = arena.alloc("z");
+
+        let pairs: Vec<_> = arena.iter_indexed().collect();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (a, &"x"));
+        assert_eq!(pairs[1], (b, &"y"));
+        assert_eq!(pairs[2], (c, &"z"));
+    }
+
+    #[test]
+    fn iter_indexed_empty() {
+        let arena: Arena<i32> = Arena::new();
+        assert_eq!(arena.iter_indexed().count(), 0);
+    }
+
+    #[test]
+    fn iter_indexed_exact_size() {
+        let mut arena = Arena::new();
+        arena.alloc(1);
+        arena.alloc(2);
+        arena.alloc(3);
+
+        let iter = arena.iter_indexed();
+        assert_eq!(iter.len(), 3);
+    }
+
+    #[test]
+    fn shrink_to_fit_reduces_capacity() {
+        let mut arena: Arena<u64> = Arena::with_capacity(1000);
+        arena.alloc(1);
+        arena.alloc(2);
+        assert!(arena.capacity() >= 1000);
+
+        arena.shrink_to_fit();
+        assert!(arena.capacity() < 1000);
+        assert_eq!(arena.len(), 2);
     }
 
     #[test]
