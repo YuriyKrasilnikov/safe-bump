@@ -23,17 +23,17 @@ accessed via typed `Idx<T>` handles.
 
 The index-based design enables **checkpoint/rollback** — save allocation state,
 allocate speculatively, then either keep or discard. Discarding runs destructors
-for rolled-back values. This pattern is essential for version-based reclamation
-(VBR) workflows where mutations are validated before committing.
+for rolled-back values. This pattern is useful when mutations must be validated
+before committing — allocate tentatively, check invariants, then keep or roll back.
 
 ## Usage
 
 ```rust
-use safe_bump::Arena;
+use safe_bump::{Arena, Idx};
 
-let mut arena = Arena::new();
-let a = arena.alloc(String::from("hello"));
-let b = arena.alloc(String::from("world"));
+let mut arena: Arena<String> = Arena::new();
+let a: Idx<String> = arena.alloc(String::from("hello"));
+let b: Idx<String> = arena.alloc(String::from("world"));
 
 assert_eq!(arena[a], "hello");
 assert_eq!(arena[b], "world");
@@ -57,8 +57,42 @@ assert_eq!(arena.len(), 0);
 `Idx<T>` is a stable, `Copy` index into the arena.
 `Checkpoint<T>` captures allocation state for rollback.
 
-Allocation is O(1) amortized (`Vec::push`). Access is O(1) (direct index).
-Rollback is O(k) where k = items dropped. Reset is O(n).
+### Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `alloc` | O(1) amortized | `Vec::push` |
+| `get` / `Index` | O(1) | direct index |
+| `alloc_extend` | O(n) | n = items from iterator |
+| `checkpoint` | O(1) | saves current length |
+| `rollback` | O(k) | k = items dropped (destructors run) |
+| `reset` | O(n) | n = all items (destructors run) |
+| `drain` | O(n) | returns owning iterator |
+| `reserve` | O(1) amortized | delegates to `Vec::reserve` |
+
+### Standard traits
+
+`Arena<T>` implements `Index<Idx<T>>`, `IndexMut<Idx<T>>`, `IntoIterator`
+(shared, mutable, and consuming), `Extend<T>`, `FromIterator<T>`, and `Default`.
+
+`Idx<T>` implements `Copy`, `Eq`, `Ord`, `Hash`, and `Debug`.
+
+`Checkpoint<T>` implements `Copy`, `Eq`, `Ord`, `Hash`, and `Debug`.
+
+## Limitations
+
+- **Typed**: each `Arena<T>` stores a single type. Use separate arenas for
+  different types.
+- **Append-only**: individual items cannot be removed. Use `rollback` to
+  discard a suffix or `reset` to clear everything.
+- **No cross-arena safety**: `Idx<T>` is a plain `usize` wrapper — it does
+  not carry an arena identifier. An index from one arena can be accidentally
+  used on another arena of the same type (panic on out-of-bounds, silent
+  wrong data if in-bounds). This is a deliberate tradeoff: keeping `Idx` at
+  one machine word (8 bytes, `Copy`) minimizes storage overhead in data
+  structures that hold many indices, and eliminates per-access arena-id
+  checks on the hot path. The same approach is used by `typed-arena` (bare
+  references), `slotmap` (keys without container id), and ECS libraries.
 
 ## References
 

@@ -198,6 +198,11 @@ impl<T> Arena<T> {
         self.items.iter()
     }
 
+    /// Returns a mutable iterator over all allocated items.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
+        self.items.iter_mut()
+    }
+
     /// Allocates multiple values from an iterator, returning the index
     /// of the first allocated item.
     ///
@@ -240,11 +245,13 @@ impl<T> Arena<T> {
         self.items.get_mut(idx.index)
     }
 
-    /// Removes all items and returns them as a [`Vec<T>`].
+    /// Removes all items, returning an iterator that yields them
+    /// in allocation order.
     ///
-    /// The arena is empty after this call. Capacity is retained.
-    pub fn drain(&mut self) -> Vec<T> {
-        self.items.drain(..).collect()
+    /// The arena is empty after the iterator is consumed or dropped.
+    /// Capacity is retained.
+    pub fn drain(&mut self) -> std::vec::Drain<'_, T> {
+        self.items.drain(..)
     }
 
     /// Returns an iterator yielding `(Idx<T>, &T)` pairs in allocation order.
@@ -253,6 +260,19 @@ impl<T> Arena<T> {
         IterIndexed {
             inner: self.items.iter().enumerate(),
         }
+    }
+
+    /// Returns a mutable iterator yielding `(Idx<T>, &mut T)` pairs in
+    /// allocation order.
+    pub fn iter_indexed_mut(&mut self) -> IterIndexedMut<'_, T> {
+        IterIndexedMut {
+            inner: self.items.iter_mut().enumerate(),
+        }
+    }
+
+    /// Reserves capacity for at least `additional` more items.
+    pub fn reserve(&mut self, additional: usize) {
+        self.items.reserve(additional);
     }
 
     /// Shrinks the backing storage to fit the current number of items.
@@ -287,6 +307,29 @@ impl<'a, T> IntoIterator for &'a Arena<T> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut Arena<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T> Extend<T> for Arena<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.items.extend(iter);
+    }
+}
+
+impl<T> std::iter::FromIterator<T> for Arena<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self {
+            items: iter.into_iter().collect(),
+        }
     }
 }
 
@@ -329,6 +372,37 @@ impl<'a, T> Iterator for IterIndexed<'a, T> {
 }
 
 impl<T> ExactSizeIterator for IterIndexed<'_, T> {}
+
+// ─── IterIndexedMut ─────────────────────────────────────────────────────────
+
+/// Mutable iterator yielding `(Idx<T>, &mut T)` pairs in allocation order.
+///
+/// Created by [`Arena::iter_indexed_mut`].
+pub struct IterIndexedMut<'a, T> {
+    inner: std::iter::Enumerate<std::slice::IterMut<'a, T>>,
+}
+
+impl<'a, T> Iterator for IterIndexedMut<'a, T> {
+    type Item = (Idx<T>, &'a mut T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(i, v)| {
+            (
+                Idx {
+                    index: i,
+                    _marker: PhantomData,
+                },
+                v,
+            )
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for IterIndexedMut<'_, T> {}
 
 // ─── Idx ─────────────────────────────────────────────────────────────────────
 
@@ -415,9 +489,35 @@ impl<T> Clone for Checkpoint<T> {
 
 impl<T> Copy for Checkpoint<T> {}
 
+impl<T> PartialEq for Checkpoint<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+    }
+}
+
+impl<T> Eq for Checkpoint<T> {}
+
+impl<T> std::hash::Hash for Checkpoint<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len.hash(state);
+    }
+}
+
 impl<T> std::fmt::Debug for Checkpoint<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Checkpoint({})", self.len)
+    }
+}
+
+impl<T> PartialOrd for Checkpoint<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Checkpoint<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.len.cmp(&other.len)
     }
 }
 
@@ -757,7 +857,7 @@ mod tests {
         arena.alloc(20);
         arena.alloc(30);
 
-        let items = arena.drain();
+        let items: Vec<_> = arena.drain().collect();
         assert_eq!(items, vec![10, 20, 30]);
         assert!(arena.is_empty());
     }
@@ -777,7 +877,7 @@ mod tests {
         arena.alloc(Tracked(Rc::clone(&drop_count)));
         arena.alloc(Tracked(Rc::clone(&drop_count)));
 
-        let items = arena.drain();
+        let items: Vec<_> = arena.drain().collect();
         assert_eq!(drop_count.get(), 0); // not dropped yet — owned by items
         drop(items);
         assert_eq!(drop_count.get(), 2); // now dropped
@@ -824,6 +924,114 @@ mod tests {
         arena.shrink_to_fit();
         assert!(arena.capacity() < 1000);
         assert_eq!(arena.len(), 2);
+    }
+
+    #[test]
+    fn iter_mut_modifies_all() {
+        let mut arena = Arena::new();
+        arena.alloc(1);
+        arena.alloc(2);
+        arena.alloc(3);
+
+        for item in &mut arena {
+            *item *= 10;
+        }
+
+        let values: Vec<_> = arena.iter().copied().collect();
+        assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn iter_indexed_mut_yields_correct_pairs() {
+        let mut arena = Arena::new();
+        let a = arena.alloc(String::from("x"));
+        let b = arena.alloc(String::from("y"));
+
+        let pairs: Vec<_> = arena
+            .iter_indexed_mut()
+            .map(|(idx, val)| (idx, val.clone()))
+            .collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], (a, String::from("x")));
+        assert_eq!(pairs[1], (b, String::from("y")));
+    }
+
+    #[test]
+    fn iter_indexed_mut_modifies() {
+        let mut arena = Arena::new();
+        arena.alloc(1);
+        arena.alloc(2);
+        arena.alloc(3);
+
+        for (_, val) in arena.iter_indexed_mut() {
+            *val += 100;
+        }
+
+        assert_eq!(arena[Idx::from_raw(0)], 101);
+        assert_eq!(arena[Idx::from_raw(1)], 102);
+        assert_eq!(arena[Idx::from_raw(2)], 103);
+    }
+
+    #[test]
+    fn iter_indexed_mut_exact_size() {
+        let mut arena = Arena::new();
+        arena.alloc(1);
+        arena.alloc(2);
+
+        let iter = arena.iter_indexed_mut();
+        assert_eq!(iter.len(), 2);
+    }
+
+    #[test]
+    fn reserve_increases_capacity() {
+        let mut arena: Arena<u64> = Arena::new();
+        arena.reserve(500);
+        assert!(arena.capacity() >= 500);
+        assert!(arena.is_empty());
+    }
+
+    #[test]
+    fn extend_trait() {
+        let mut arena = Arena::new();
+        arena.alloc(1);
+        arena.extend(vec![2, 3, 4]);
+        assert_eq!(arena.len(), 4);
+
+        let values: Vec<_> = arena.iter().copied().collect();
+        assert_eq!(values, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn from_iterator() {
+        let arena: Arena<i32> = (0..5).collect();
+        assert_eq!(arena.len(), 5);
+        assert_eq!(arena[Idx::from_raw(0)], 0);
+        assert_eq!(arena[Idx::from_raw(4)], 4);
+    }
+
+    #[test]
+    fn checkpoint_equality() {
+        let mut arena = Arena::new();
+        let cp1 = arena.checkpoint();
+        let cp2 = arena.checkpoint();
+        assert_eq!(cp1, cp2);
+
+        arena.alloc(1);
+        let cp3 = arena.checkpoint();
+        assert_ne!(cp1, cp3);
+    }
+
+    #[test]
+    fn checkpoint_ordering() {
+        let mut arena = Arena::new();
+        let cp1 = arena.checkpoint();
+        arena.alloc(1);
+        let cp2 = arena.checkpoint();
+        arena.alloc(2);
+        let cp3 = arena.checkpoint();
+
+        assert!(cp1 < cp2);
+        assert!(cp2 < cp3);
     }
 
     #[test]
