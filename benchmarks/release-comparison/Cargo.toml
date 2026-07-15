@@ -1,0 +1,20 @@
+[package]
+name = "safe-bump-release-comparison"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+safe-bump-current = { package = "safe-bump", path = "../..", features = ["experimental-shared"] }
+safe-bump-v2 = { package = "safe-bump", version = "=0.2.1" }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "release"
+harness = false
+
+[workspace]
+resolver = "3"

@@ -1,0 +1,216 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/benchmarks.yml"
+      - "benches/**"
+      - "benchmarks/**"
+      - "src/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+
+jobs:
+  benchmark-build:
+    name: Compile benchmark harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.93
+        run: rustup toolchain install 1.93.0 --profile minimal --component clippy
+
+      - name: Compile all benchmarks
+        run: cargo +1.93.0 bench --locked --all-features --no-run
+
+      - name: Compile v0.2.1 to v0.3.0 comparison
+        run: >-
+          CARGO_TARGET_DIR=target/release-comparison
+          cargo +1.93.0 bench --locked
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+          --no-run
+
+      - name: Compile raw paired runner
+        run: >-
+          CARGO_TARGET_DIR=target/release-comparison
+          cargo +1.93.0 build --locked --release
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+          --bin raw_pairs
+
+      - name: Lint release comparison
+        run: >-
+          CARGO_TARGET_DIR=target/release-comparison
+          cargo +1.93.0 clippy --locked
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+          --all-targets -- -D warnings
+
+      - name: Verify cross-version quality witnesses
+        run: >-
+          CARGO_TARGET_DIR=target/release-comparison
+          cargo +1.93.0 test --locked
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+
+      - name: Verify benchmark report contract
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
+  benchmark-run:
+    name: Run and publish benchmarks
+    if: github.event_name != 'pull_request'
+    needs: benchmark-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.93
+        run: rustup toolchain install 1.93.0 --profile minimal
+
+      - name: Record runner passport
+        run: |
+          {
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "commit=${GITHUB_SHA}"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            rustc +1.93.0 -Vv
+            cargo +1.93.0 -Vv
+            uname -a
+            lscpu
+          } > benchmark-host.txt
+
+      - name: "[1/6] Run current-version benchmarks"
+        run: |
+          set -o pipefail
+          : > benchmark-output-current.txt
+          benches=(arena blocks rollback shared_arena)
+          total=${#benches[@]}
+          for index in "${!benches[@]}"; do
+            bench=${benches[$index]}
+            echo "benchmark_progress phase=1/6 harness=$((index + 1))/${total} workload=- repetition=- name=${bench} status=running"
+            cargo +1.93.0 bench --locked --all-features --bench "${bench}" 2>&1 |
+              tee -a benchmark-output-current.txt
+            echo "benchmark_progress phase=1/6 harness=$((index + 1))/${total} workload=- repetition=- name=${bench} status=complete"
+          done
+
+      - name: "[2/6] Compare v0.2.1 with v0.3.0"
+        run: |
+          set -o pipefail
+          CARGO_TARGET_DIR="${PWD}/target/release-comparison" \
+          CRITERION_HOME="${PWD}/target/release-comparison/criterion" \
+            cargo +1.93.0 bench --locked \
+              --manifest-path benchmarks/release-comparison/Cargo.toml \
+              2>&1 |
+            python3 benchmarks/stream_criterion_progress.py \
+              --manifest benchmarks/release-comparison/workloads.tsv \
+              --manifest-header safe-bump-release-workloads-v1 \
+              --previous v0.2.1 \
+              --current v0.3.0 \
+              --phase 2/6 |
+            tee benchmark-output-release-comparison.txt
+
+      - name: "[3/6] Record balanced raw pairs"
+        run: >-
+          CARGO_TARGET_DIR="${PWD}/target/release-comparison"
+          cargo +1.93.0 run --locked --release
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+          --bin raw_pairs -- --repetitions 15
+          > benchmark-raw-pairs.tsv
+
+      - name: "[4/6] Validate raw-pair completeness and witnesses"
+        run: >-
+          python3 benchmarks/validate_raw_pairs.py
+          benchmark-raw-pairs.tsv
+          --manifest benchmarks/release-comparison/workloads.tsv
+          --manifest-header safe-bump-release-workloads-v1
+          --schema safe-bump-raw-pairs-v1
+          --previous v0.2.1
+          --current v0.3.0
+          --repetitions 15
+
+      - name: "[5/6] Render release delta"
+        run: >-
+          python3 benchmarks/render_criterion_delta.py
+          target/release-comparison/criterion
+          --manifest benchmarks/release-comparison/workloads.tsv
+          --manifest-header safe-bump-release-workloads-v1
+          --previous v0.2.1
+          --current v0.3.0
+          --output benchmark-release-delta.md
+
+      - name: "[6/6] Add benchmark summary (1/2)"
+        if: always()
+        run: |
+          {
+            echo "## safe-bump benchmarks"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+            if [[ -f benchmark-release-delta.md ]]; then
+              cat benchmark-release-delta.md
+            else
+              echo "_Release delta unavailable; inspect the failed render step._"
+            fi
+            echo
+            cat benchmarks/release-comparison/QUALITY.md
+            echo
+            echo "The complete Criterion report and runner passport are attached as the \`safe-bump-benchmarks-${GITHUB_SHA}\` artifact."
+            echo "Balanced AB/BA raw observations are attached as \`benchmark-raw-pairs.tsv\`; this workflow does not claim a performance winner."
+            echo
+            echo "<details><summary>Current-version Criterion console output</summary>"
+            echo
+            echo '```text'
+            sed -n '1,600p' benchmark-output-current.txt
+            echo '```'
+            echo "</details>"
+            echo
+            echo "<details><summary>v0.2.1 to v0.3.0 Criterion console output</summary>"
+            echo
+            echo '```text'
+            sed -n '1,600p' benchmark-output-release-comparison.txt
+            echo '```'
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: "[6/6] Upload benchmark report (2/2)"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: safe-bump-benchmarks-${{ github.sha }}
+          path: |
+            benchmark-host.txt
+            benchmark-output-current.txt
+            benchmark-output-release-comparison.txt
+            benchmark-release-delta.md
+            benchmark-raw-pairs.tsv
+            benchmarks/release-comparison/QUALITY.md
+            target/criterion
+            target/release-comparison/criterion
+          if-no-files-found: error
+          retention-days: 90

@@ -1,24 +1,25 @@
 //! Safe bump-pointer arena allocator.
 //!
-//! `safe-bump` provides two typed arena allocators built entirely with safe
-//! Rust (zero `unsafe` blocks). Values are allocated and accessed via stable
-//! [`Idx<T>`] indices.
+//! `safe-bump` provides a typed arena allocator built entirely with safe Rust
+//! (zero `unsafe` blocks). Values are allocated and accessed through
+//! unforgeable [`Idx<T>`] capabilities. Batch allocation returns a [`Block<T>`]
+//! that is the only public way to derive indices within a contiguous batch.
 //!
-//! # Arena types
+//! # Arena type
 //!
-//! - [`Arena<T>`] — single-thread, zero overhead, backed by [`Vec<T>`]
-//! - [`SharedArena<T>`] — thread-safe (`Send + Sync`), wait-free reads,
-//!   concurrent allocation via `&self`
-//!
-//! Both types share the same [`Idx<T>`] and [`Checkpoint<T>`] types, support
-//! checkpoint/rollback, and run destructors on rollback/reset/drop.
+//! [`Arena<T>`] stores values contiguously in a [`Vec<T>`]. Allocation stamps
+//! live in a parallel metadata vector, so sequential value traversal retains
+//! the locality of an ordinary vector. Checkpoints are bound to one arena and
+//! one historical allocation prefix.
 //!
 //! # Key properties
 //!
 //! - **Zero `unsafe`**: enforced by `#![forbid(unsafe_code)]`
 //! - **Auto [`Drop`]**: destructors run on reset, rollback, and arena drop
-//! - **Checkpoint/rollback**: save state and discard speculative allocations
-//! - **Thread-safe**: [`SharedArena<T>`] supports concurrent allocation
+//! - **Unforgeable handles**: no public raw-index constructor
+//! - **ABA resistance**: reused slots receive fresh allocation stamps
+//! - **Validated rollback**: foreign and diverged checkpoints are rejected
+//! - **Explicit blocks**: batch contiguity is carried by [`Block<T>`]
 //!
 //! # Example
 //!
@@ -47,16 +48,22 @@
 #![deny(missing_docs)]
 
 mod arena;
+mod block;
 mod checkpoint;
+#[cfg(feature = "experimental-shared")]
 mod chunked_storage;
 mod idx;
 mod iter;
+#[cfg(feature = "experimental-shared")]
 mod shared_arena;
+mod stamp;
 
 pub use arena::Arena;
-pub use checkpoint::Checkpoint;
+pub use block::{Block, BlockIndices};
+pub use checkpoint::{Checkpoint, CheckpointError};
 pub use idx::Idx;
-pub use iter::{IterIndexed, IterIndexedMut};
+pub use iter::{ArenaDrain, ArenaIntoIter, IterIndexed, IterIndexedMut};
+#[cfg(feature = "experimental-shared")]
 pub use shared_arena::{SharedArena, SharedArenaIter, SharedArenaIterIndexed};
 
 #[cfg(test)]

@@ -1,40 +1,55 @@
 use std::marker::PhantomData;
 
-/// Stable index into an [`Arena`](crate::Arena) or
-/// [`SharedArena`](crate::SharedArena).
+use crate::stamp::Stamp;
+
+/// Unforgeable capability naming one allocation slot.
 ///
-/// Obtained from [`Arena::alloc`](crate::Arena::alloc) or
-/// [`SharedArena::alloc`](crate::SharedArena::alloc). Implements [`Copy`],
-/// so it can be freely duplicated and stored in data structures.
+/// An index is produced by [`Arena::alloc`](crate::Arena::alloc), by
+/// [`Block::get`](crate::Block::get), or by an indexed arena iterator. It
+/// carries both an absolute slot and a fresh allocation stamp. Consequently,
+/// an index from another arena or from a rolled-back allocation cannot alias a
+/// new value that later reuses the same slot.
 ///
-/// Valid as long as the arena has not been reset or rolled back past
-/// this index.
+/// `Idx<T>` is [`Copy`], but has no public constructor from an integer.
 ///
-/// # Panics
+/// ```compile_fail
+/// use safe_bump::Idx;
 ///
-/// Indexing with a stale `Idx` (after rollback/reset) panics with
-/// an out-of-bounds error.
+/// let _forged = Idx::<u8>::from_raw(0);
+/// ```
 pub struct Idx<T> {
-    index: usize,
-    _marker: PhantomData<T>,
+    stamp: Stamp,
+    slot: usize,
+    marker: PhantomData<fn() -> T>,
 }
 
 impl<T> Idx<T> {
-    /// Returns the raw index value.
-    #[must_use]
-    pub const fn into_raw(self) -> usize {
-        self.index
+    pub(crate) const fn new(stamp: Stamp, slot: usize) -> Self {
+        Self {
+            stamp,
+            slot,
+            marker: PhantomData,
+        }
     }
 
-    /// Creates an index from a raw value.
+    pub(crate) const fn stamp(self) -> Stamp {
+        self.stamp
+    }
+
+    /// Returns the absolute storage slot for diagnostics and ordering.
     ///
-    /// The caller must ensure the index is valid for the target arena.
+    /// The slot alone is not a capability and cannot be converted back into
+    /// an `Idx` through the public API.
     #[must_use]
-    pub const fn from_raw(index: usize) -> Self {
-        Self {
-            index,
-            _marker: PhantomData,
-        }
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+
+    /// Returns `true` when both indices were created by the same allocation
+    /// operation.
+    #[must_use]
+    pub const fn same_allocation<U>(self, other: Idx<U>) -> bool {
+        self.stamp.get() == other.stamp.get()
     }
 }
 
@@ -48,7 +63,7 @@ impl<T> Copy for Idx<T> {}
 
 impl<T> PartialEq for Idx<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.index == other.index
+        self.stamp == other.stamp && self.slot == other.slot
     }
 }
 
@@ -56,13 +71,17 @@ impl<T> Eq for Idx<T> {}
 
 impl<T> std::hash::Hash for Idx<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.index.hash(state);
+        self.slot.hash(state);
+        self.stamp.hash(state);
     }
 }
 
 impl<T> std::fmt::Debug for Idx<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Idx({})", self.index)
+        f.debug_struct("Idx")
+            .field("slot", &self.slot)
+            .field("stamp", &self.stamp.get())
+            .finish()
     }
 }
 
@@ -74,6 +93,6 @@ impl<T> PartialOrd for Idx<T> {
 
 impl<T> Ord for Idx<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.index.cmp(&other.index)
+        (self.slot, self.stamp).cmp(&(other.slot, other.stamp))
     }
 }

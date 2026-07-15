@@ -1,6 +1,6 @@
 [package]
 name = "safe-bump"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Yuriy Krasilnikov <YuriyKrasilnikov@users.noreply.github.com>"]
 edition = "2024"
 rust-version = "1.93"
@@ -9,9 +9,28 @@ repository = "https://github.com/YuriyKrasilnikov/safe-bump"
 homepage = "https://github.com/YuriyKrasilnikov/safe-bump"
 documentation = "https://docs.rs/safe-bump"
 readme = "README.md"
-description = "Safe typed arena — zero unsafe, auto Drop, checkpoint/rollback, single-thread Arena + concurrent SharedArena"
+include = [
+    "/src/**",
+    "/benches/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/Cargo.toml",
+]
+description = "Safe typed arena with unforgeable indices, contiguous allocation blocks, and validated rollback"
 categories = ["memory-management", "data-structures"]
 keywords = ["arena", "allocator", "bump", "memory", "safe"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+bench = false
+
+[features]
+default = []
+experimental-shared = []
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
@@ -21,4 +40,25 @@ pedantic = "deny"
 nursery = "deny"
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.10.0"
+
+[[bench]]
+name = "arena"
+harness = false
+
+[[bench]]
+name = "blocks"
+harness = false
+
+[[bench]]
+name = "rollback"
+harness = false
+
+[[bench]]
+name = "shared_arena"
+harness = false
+required-features = ["experimental-shared"]
+
+[workspace]
+resolver = "3"

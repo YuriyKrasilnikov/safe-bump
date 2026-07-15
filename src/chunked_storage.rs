@@ -1,13 +1,17 @@
 use std::sync::OnceLock;
 
-/// Append-only storage where elements never move after insertion.
+/// Stable-address chunked storage.
 ///
 /// Backed by a fixed array of lazily-allocated chunks with doubling sizes.
-/// Chunk `k` has `2^k` slots. 32 chunks support up to `2^32 - 1` elements.
+/// Chunk `k` has `2^k` slots. The number of chunks follows the target pointer
+/// width instead of imposing an undocumented 32-bit index ceiling.
 ///
-/// All operations are safe. Growth uses [`OnceLock::get_or_init`] (lock-free).
+/// Occupied elements never move. Exclusive rollback/reset operations may clear
+/// slots and later allocations may reuse them. All operations are safe; lazy
+/// chunk initialization is synchronized by [`OnceLock::get_or_init`] and may
+/// wait when another thread is initializing the same chunk.
 pub struct ChunkedStorage<T> {
-    chunks: [OnceLock<Box<[OnceLock<T>]>>; 32],
+    chunks: [OnceLock<Box<[OnceLock<T>]>>; usize::BITS as usize],
 }
 
 impl<T> ChunkedStorage<T> {
@@ -15,7 +19,7 @@ impl<T> ChunkedStorage<T> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            chunks: [const { OnceLock::new() }; 32],
+            chunks: [const { OnceLock::new() }; usize::BITS as usize],
         }
     }
 
@@ -88,7 +92,9 @@ impl<T> ChunkedStorage<T> {
 /// index 7 → chunk 3, offset 0   (chunk 3: 8 slots)
 /// ```
 const fn split_index(index: usize) -> (usize, usize) {
-    let n = index + 1;
+    let Some(n) = index.checked_add(1) else {
+        panic!("chunked storage cannot represent usize::MAX as a slot");
+    };
     let chunk = usize::BITS - n.leading_zeros() - 1;
     let offset = n - (1 << chunk);
     (chunk as usize, offset)

@@ -135,7 +135,7 @@ fn rollback_to_empty() {
 }
 
 #[test]
-#[should_panic(expected = "checkpoint 5 beyond current length 2")]
+#[should_panic(expected = "checkpoint length 5 exceeds current length 2")]
 fn rollback_beyond_length_panics() {
     let mut arena = Arena::new();
     arena.alloc(1);
@@ -150,7 +150,7 @@ fn rollback_beyond_length_panics() {
 }
 
 #[test]
-#[should_panic(expected = "index out of bounds")]
+#[should_panic(expected = "foreign or stale")]
 fn stale_index_panics() {
     let mut arena = Arena::new();
     let _a = arena.alloc(1);
@@ -170,9 +170,10 @@ fn idx_is_copy() {
 
 #[test]
 fn idx_equality() {
-    let a = Idx::<i32>::from_raw(5);
-    let b = Idx::<i32>::from_raw(5);
-    let c = Idx::<i32>::from_raw(3);
+    let mut arena = Arena::new();
+    let a = arena.alloc(5);
+    let b = a;
+    let c = arena.alloc(3);
 
     assert_eq!(a, b);
     assert_ne!(a, c);
@@ -180,16 +181,20 @@ fn idx_equality() {
 
 #[test]
 fn idx_ordering() {
-    let a = Idx::<i32>::from_raw(1);
-    let b = Idx::<i32>::from_raw(5);
+    let mut arena = Arena::new();
+    let a = arena.alloc(1);
+    let b = arena.alloc(5);
 
     assert!(a < b);
 }
 
 #[test]
-fn idx_raw_roundtrip() {
-    let idx = Idx::<String>::from_raw(42);
-    assert_eq!(idx.into_raw(), 42);
+fn idx_exposes_slot_without_a_reverse_constructor() {
+    let mut arena = Arena::new();
+    let first = arena.alloc(String::from("first"));
+    let second = arena.alloc(String::from("second"));
+    assert_eq!(first.slot(), 0);
+    assert_eq!(second.slot(), 1);
 }
 
 #[test]
@@ -240,23 +245,28 @@ fn reuse_after_reset() {
 }
 
 #[test]
-fn alloc_extend_returns_first_idx() {
+fn alloc_block_carries_every_contiguous_index() {
     let mut arena = Arena::new();
     arena.alloc(0);
 
-    let first = arena.alloc_extend(vec![10, 20, 30]);
-    assert_eq!(first, Some(Idx::from_raw(1)));
+    let block = arena.alloc_block(vec![10, 20, 30]);
+    assert_eq!(block.len(), 3);
+    assert_eq!(block.first().map(Idx::slot), Some(1));
     assert_eq!(arena.len(), 4);
-    assert_eq!(arena[Idx::from_raw(1)], 10);
-    assert_eq!(arena[Idx::from_raw(2)], 20);
-    assert_eq!(arena[Idx::from_raw(3)], 30);
+    assert_eq!(arena[block.get(0).unwrap()], 10);
+    assert_eq!(arena[block.get(1).unwrap()], 20);
+    assert_eq!(arena[block.get(2).unwrap()], 30);
+    assert_eq!(block.get(3), None);
+    assert!(block.indices().all(|idx| block.contains(idx)));
 }
 
 #[test]
-fn alloc_extend_empty_returns_none() {
+fn alloc_block_empty_returns_an_empty_capability() {
     let mut arena: Arena<i32> = Arena::new();
-    let result = arena.alloc_extend(std::iter::empty());
-    assert_eq!(result, None);
+    let result = arena.alloc_block(std::iter::empty());
+    assert!(result.is_empty());
+    assert_eq!(result.first(), None);
+    assert_eq!(result.indices().count(), 0);
     assert!(arena.is_empty());
 }
 
@@ -409,17 +419,17 @@ fn iter_indexed_mut_yields_correct_pairs() {
 #[test]
 fn iter_indexed_mut_modifies() {
     let mut arena = Arena::new();
-    arena.alloc(1);
-    arena.alloc(2);
-    arena.alloc(3);
+    let first = arena.alloc(1);
+    let second = arena.alloc(2);
+    let third = arena.alloc(3);
 
     for (_, val) in arena.iter_indexed_mut() {
         *val += 100;
     }
 
-    assert_eq!(arena[Idx::from_raw(0)], 101);
-    assert_eq!(arena[Idx::from_raw(1)], 102);
-    assert_eq!(arena[Idx::from_raw(2)], 103);
+    assert_eq!(arena[first], 101);
+    assert_eq!(arena[second], 102);
+    assert_eq!(arena[third], 103);
 }
 
 #[test]
@@ -455,8 +465,11 @@ fn extend_trait() {
 fn from_iterator() {
     let arena: Arena<i32> = (0..5).collect();
     assert_eq!(arena.len(), 5);
-    assert_eq!(arena[Idx::from_raw(0)], 0);
-    assert_eq!(arena[Idx::from_raw(4)], 4);
+    let indexed: Vec<_> = arena
+        .iter_indexed()
+        .map(|(idx, value)| (idx.slot(), *value))
+        .collect();
+    assert_eq!(indexed, vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
 }
 
 #[test]
@@ -525,4 +538,94 @@ fn into_iter_consuming() {
 
     let collected: Vec<String> = arena.into_iter().collect();
     assert_eq!(collected, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn equal_slots_from_different_arenas_do_not_alias() {
+    let mut left = Arena::new();
+    let mut right = Arena::new();
+    let left_idx = left.alloc(10);
+    let right_idx = right.alloc(20);
+
+    assert_eq!(left_idx.slot(), right_idx.slot());
+    assert_ne!(left_idx, right_idx);
+    assert_eq!(left.try_get(right_idx), None);
+    assert_eq!(right.try_get(left_idx), None);
+}
+
+#[test]
+fn reset_and_reallocation_do_not_resurrect_an_old_index() {
+    let mut arena = Arena::new();
+    let stale = arena.alloc(String::from("old"));
+    arena.reset();
+    let current = arena.alloc(String::from("new"));
+
+    assert_eq!(stale.slot(), current.slot());
+    assert_ne!(stale, current);
+    assert_eq!(arena.try_get(stale), None);
+    assert_eq!(arena.try_get(current).map(String::as_str), Some("new"));
+}
+
+#[test]
+fn foreign_checkpoint_is_rejected_without_mutation() {
+    let left: Arena<i32> = Arena::new();
+    let foreign = left.checkpoint();
+    let mut right = Arena::new();
+    let live = right.alloc(7);
+
+    assert_eq!(
+        right.try_rollback(foreign),
+        Err(CheckpointError::ForeignArena)
+    );
+    assert_eq!(right[live], 7);
+}
+
+#[test]
+fn equal_length_checkpoint_from_a_discarded_branch_is_rejected() {
+    let mut arena = Arena::new();
+    let _root = arena.alloc(0);
+    let branch_point = arena.checkpoint();
+    let stale = arena.alloc(1);
+    let stale_prefix = arena.checkpoint();
+
+    arena.rollback(branch_point);
+    let replacement = arena.alloc(2);
+    assert_eq!(stale.slot(), replacement.slot());
+    assert_eq!(arena.len(), stale_prefix.len());
+    assert_eq!(arena.try_get(stale), None);
+    assert_eq!(
+        arena.try_rollback(stale_prefix),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+    assert_eq!(arena[replacement], 2);
+}
+
+#[test]
+fn rollback_keeps_metadata_aligned_when_a_destructor_panics() {
+    struct PanicOnce(Rc<Cell<bool>>);
+
+    impl Drop for PanicOnce {
+        fn drop(&mut self) {
+            assert!(self.0.replace(true), "intentional destructor panic");
+        }
+    }
+
+    let tripped = Rc::new(Cell::new(false));
+    let mut arena = Arena::new();
+    let _kept = arena.alloc(PanicOnce(Rc::clone(&tripped)));
+    let checkpoint = arena.checkpoint();
+    let first_suffix = arena.alloc(PanicOnce(Rc::clone(&tripped)));
+    let panicking_suffix = arena.alloc(PanicOnce(Rc::clone(&tripped)));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arena.rollback(checkpoint);
+    }));
+    assert!(result.is_err());
+    assert_eq!(arena.len(), 2);
+    assert!(!arena.is_valid(panicking_suffix));
+    assert!(arena.is_valid(first_suffix));
+
+    arena.rollback(checkpoint);
+    assert_eq!(arena.len(), 1);
+    assert!(!arena.is_valid(first_suffix));
 }

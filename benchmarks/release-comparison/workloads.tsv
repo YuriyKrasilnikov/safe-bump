@@ -1,0 +1,17 @@
+safe-bump-release-workloads-v1
+release/allocation	64
+release/allocation	1024
+release/allocation	65536
+release/validated_lookup	64
+release/validated_lookup	1024
+release/validated_lookup	65536
+release/iteration	64
+release/iteration	1024
+release/iteration	65536
+release/speculative_rollback	1
+release/speculative_rollback	64
+release/speculative_rollback	1024
+release/shared_concurrent_allocation	1
+release/shared_concurrent_allocation	2
+release/shared_concurrent_allocation	4
+release/shared_concurrent_allocation	8

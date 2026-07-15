@@ -41,16 +41,16 @@ proptest! {
     #[test]
     fn arbitrary_ops_preserve_model(ops in prop::collection::vec(op_strategy(), 0..200)) {
         let mut arena = Arena::new();
-        let mut model: Vec<i32> = Vec::new();
+        let mut model: Vec<(Idx<i32>, i32)> = Vec::new();
+        let mut all_indices: Vec<Idx<i32>> = Vec::new();
         let mut arena_cps: Vec<Checkpoint<i32>> = Vec::new();
-        let mut high_water: usize = 0;
 
         for op in ops {
             match op {
                 Op::Alloc(val) => {
-                    arena.alloc(val);
-                    model.push(val);
-                    high_water = high_water.max(model.len());
+                    let idx = arena.alloc(val);
+                    model.push((idx, val));
+                    all_indices.push(idx);
                 }
                 Op::Checkpoint => {
                     arena_cps.push(arena.checkpoint());
@@ -71,11 +71,15 @@ proptest! {
 
             // contents match model
             let arena_vals: Vec<i32> = arena.iter().copied().collect();
-            prop_assert_eq!(&arena_vals, &model);
+            let model_vals: Vec<i32> = model.iter().map(|(_, value)| *value).collect();
+            prop_assert_eq!(&arena_vals, &model_vals);
 
-            // stale indices are invalid
-            for i in arena.len()..high_water {
-                prop_assert!(!arena.is_valid(Idx::from_raw(i)));
+            // Exactly the capabilities retained by the model are valid. This
+            // distinguishes stale and current indices even when a slot is
+            // reused after rollback.
+            for &idx in &all_indices {
+                let expected = model.iter().any(|(live, _)| *live == idx);
+                prop_assert_eq!(arena.is_valid(idx), expected);
             }
         }
     }
@@ -130,21 +134,22 @@ proptest! {
 
     /// Random alloc/checkpoint/rollback sequence on SharedArena —
     /// contents always match model, stale indices are invalid.
+    #[cfg(feature = "experimental-shared")]
     #[test]
     fn shared_arena_arbitrary_ops_preserve_model(
         ops in prop::collection::vec(op_strategy(), 0..200)
     ) {
         let mut arena = SharedArena::new();
         let mut model: Vec<(Idx<i32>, i32)> = Vec::new();
+        let mut all_indices: Vec<Idx<i32>> = Vec::new();
         let mut arena_cps: Vec<Checkpoint<i32>> = Vec::new();
-        let mut high_water: usize = 0;
 
         for op in ops {
             match op {
                 Op::Alloc(val) => {
                     let idx = arena.alloc(val);
                     model.push((idx, val));
-                    high_water = high_water.max(model.len());
+                    all_indices.push(idx);
                 }
                 Op::Checkpoint => {
                     arena_cps.push(arena.checkpoint());
@@ -168,15 +173,16 @@ proptest! {
                 prop_assert_eq!(*arena.get(idx), expected);
             }
 
-            // stale indices are invalid
-            for i in arena.len()..high_water {
-                prop_assert!(!arena.is_valid(Idx::from_raw(i)));
+            for &idx in &all_indices {
+                let expected = model.iter().any(|(live, _)| *live == idx);
+                prop_assert_eq!(arena.is_valid(idx), expected);
             }
         }
     }
 
     /// Random alloc/checkpoint/rollback sequence on SharedArena —
     /// every allocated value is dropped exactly once.
+    #[cfg(feature = "experimental-shared")]
     #[test]
     fn shared_arena_arbitrary_ops_drop_exactly_once(
         ops in prop::collection::vec(drop_op_strategy(), 0..200)

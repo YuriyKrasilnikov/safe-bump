@@ -13,4 +13,5 @@ impl Drop for Tracked {
 
 mod arena;
 mod prop_tests;
+#[cfg(feature = "experimental-shared")]
 mod shared_arena;

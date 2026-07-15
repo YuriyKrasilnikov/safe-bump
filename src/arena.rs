@@ -1,190 +1,269 @@
-use crate::{Checkpoint, Idx, IterIndexed, IterIndexedMut};
+use crate::stamp::Stamp;
+use crate::{
+    ArenaDrain, ArenaIntoIter, Block, Checkpoint, CheckpointError, Idx, IterIndexed, IterIndexedMut,
+};
 
-/// Single-thread typed arena allocator.
+/// Single-thread typed arena with stamped allocation capabilities.
 ///
-/// Stores values of type `T` in a contiguous buffer, returning stable
-/// [`Idx<T>`] handles for O(1) access. Values are dropped when the arena
-/// is dropped, reset, or rolled back past their allocation point.
-///
-/// For thread-safe concurrent allocation, see [`SharedArena`](crate::SharedArena).
+/// Values stay contiguous in a [`Vec<T>`]. A parallel stamp vector validates
+/// handles without interleaving metadata with values, preserving sequential
+/// traversal locality.
 pub struct Arena<T> {
+    owner: Stamp,
     items: Vec<T>,
+    stamps: Vec<Stamp>,
 }
 
 impl<T> Arena<T> {
-    /// Creates an empty arena.
+    /// Creates an empty arena with a fresh identity.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { items: Vec::new() }
-    }
-
-    /// Creates an arena with pre-allocated capacity for `capacity` items.
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            items: Vec::with_capacity(capacity),
+            owner: Stamp::fresh(),
+            items: Vec::new(),
+            stamps: Vec::new(),
         }
     }
 
-    /// Allocates a value in the arena, returning its stable index.
-    ///
-    /// O(1) amortized (backed by [`Vec::push`]).
-    pub fn alloc(&mut self, value: T) -> Idx<T> {
-        let index = self.items.len();
-        self.items.push(value);
-        Idx::from_raw(index)
+    /// Creates an empty arena with capacity for at least `capacity` values.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            owner: Stamp::fresh(),
+            items: Vec::with_capacity(capacity),
+            stamps: Vec::with_capacity(capacity),
+        }
     }
 
-    /// Returns a reference to the value at `idx`.
+    /// Allocates one value and returns its unforgeable index.
+    pub fn alloc(&mut self, value: T) -> Idx<T> {
+        self.reserve(1);
+        let stamp = Stamp::fresh();
+        let slot = self.items.len();
+        self.items.push(value);
+        self.stamps.push(stamp);
+        Idx::new(stamp, slot)
+    }
+
+    /// Allocates one contiguous batch and returns its block capability.
+    ///
+    /// The input is fully collected before arena state changes. If iteration
+    /// panics, the arena therefore retains its original prefix.
+    pub fn alloc_block(&mut self, iter: impl IntoIterator<Item = T>) -> Block<T> {
+        let mut values: Vec<T> = iter.into_iter().collect();
+        let len = values.len();
+        if len == 0 {
+            return Block::empty();
+        }
+
+        self.reserve(len);
+        let stamp = Stamp::fresh();
+        let start = self.items.len();
+        self.items.append(&mut values);
+        self.stamps.resize(self.items.len(), stamp);
+        Block::new(stamp, start, len)
+    }
+
+    /// Returns a reference to the value named by `idx`.
     ///
     /// # Panics
     ///
-    /// Panics if `idx` is out of bounds (stale after rollback/reset).
+    /// Panics when the index belongs to another arena/allocation or has become
+    /// stale after rollback, reset, or drain.
     #[must_use]
     pub fn get(&self, idx: Idx<T>) -> &T {
-        &self.items[idx.into_raw()]
+        self.try_get(idx)
+            .unwrap_or_else(|| panic!("index capability is foreign or stale: {idx:?}"))
     }
 
-    /// Returns a mutable reference to the value at `idx`.
+    /// Returns a mutable reference to the value named by `idx`.
     ///
     /// # Panics
     ///
-    /// Panics if `idx` is out of bounds (stale after rollback/reset).
+    /// Panics when the index is foreign or stale.
     #[must_use]
     pub fn get_mut(&mut self, idx: Idx<T>) -> &mut T {
-        &mut self.items[idx.into_raw()]
+        self.try_get_mut(idx)
+            .unwrap_or_else(|| panic!("index capability is foreign or stale: {idx:?}"))
     }
 
-    /// Returns the number of allocated items.
+    /// Returns the number of live values.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.items.len()
     }
 
-    /// Returns `true` if the arena contains no items.
+    /// Returns `true` when the arena contains no live values.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    /// Returns the current capacity in items.
+    /// Returns the number of values that can be stored without growing either
+    /// the value or metadata vector.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        self.items.capacity()
+        let item_capacity = self.items.capacity();
+        let stamp_capacity = self.stamps.capacity();
+        if item_capacity < stamp_capacity {
+            item_capacity
+        } else {
+            stamp_capacity
+        }
     }
 
-    /// Saves the current allocation state.
-    ///
-    /// Use with [`rollback`](Arena::rollback) to discard allocations
-    /// made after this point.
+    /// Saves the current historical allocation prefix.
     #[must_use]
-    pub const fn checkpoint(&self) -> Checkpoint<T> {
-        Checkpoint::from_len(self.items.len())
+    pub fn checkpoint(&self) -> Checkpoint<T> {
+        Checkpoint::new(self.owner, self.items.len(), self.stamps.last().copied())
     }
 
-    /// Rolls back to a previous checkpoint, dropping all values
-    /// allocated after it.
+    /// Validates and rolls back to `checkpoint`.
     ///
-    /// O(k) where k = number of items dropped (destructors run).
+    /// Values after the saved prefix are dropped from the highest slot toward
+    /// the prefix. The arena is unchanged when validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError`] for a foreign checkpoint, a checkpoint
+    /// beyond the current length, or a historical prefix that was replaced.
     ///
     /// # Panics
     ///
-    /// Panics if `cp` points beyond the current length.
-    pub fn rollback(&mut self, cp: Checkpoint<T>) {
-        assert!(
-            cp.len() <= self.items.len(),
-            "checkpoint {} beyond current length {}",
-            cp.len(),
-            self.items.len(),
-        );
-        self.items.truncate(cp.len());
+    /// A destructor in the discarded suffix may panic. Each value and its
+    /// stamp are removed before its destructor runs, so the arena remains
+    /// structurally aligned during unwinding.
+    pub fn try_rollback(&mut self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
+        self.validate_checkpoint(checkpoint)?;
+        while self.items.len() > checkpoint.len() {
+            let value = self
+                .items
+                .pop()
+                .expect("the rollback loop observes a non-empty suffix");
+            let _stamp = self
+                .stamps
+                .pop()
+                .expect("arena value and stamp vectors have equal length");
+            drop(value);
+        }
+        Ok(())
     }
 
-    /// Removes all items, running their destructors.
+    /// Rolls back to a validated checkpoint.
     ///
-    /// Retains allocated memory for reuse.
-    pub fn reset(&mut self) {
-        self.items.clear();
+    /// # Panics
+    ///
+    /// Panics when the checkpoint belongs to another arena, extends beyond the
+    /// current state, or names a prefix that was discarded and replaced.
+    pub fn rollback(&mut self, checkpoint: Checkpoint<T>) {
+        if let Err(error) = self.try_rollback(checkpoint) {
+            panic!("invalid checkpoint: {error}");
+        }
     }
 
-    /// Returns an iterator over all allocated items.
+    /// Removes all values while retaining allocated capacity.
+    ///
+    /// # Panics
+    ///
+    /// A value destructor may panic. The value and its stamp are removed
+    /// before the destructor runs, preserving the arena invariant.
+    pub fn reset(&mut self) {
+        while let Some(value) = self.items.pop() {
+            let _stamp = self
+                .stamps
+                .pop()
+                .expect("arena value and stamp vectors have equal length");
+            drop(value);
+        }
+    }
+
+    /// Returns an iterator over values in allocation order.
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.items.iter()
     }
 
-    /// Returns a mutable iterator over all allocated items.
+    /// Returns a mutable iterator over values in allocation order.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
         self.items.iter_mut()
     }
 
-    /// Allocates multiple values from an iterator, returning the index
-    /// of the first allocated item.
-    ///
-    /// Returns `None` if the iterator is empty.
-    ///
-    /// O(n) where n = items yielded by the iterator.
-    pub fn alloc_extend(&mut self, iter: impl IntoIterator<Item = T>) -> Option<Idx<T>> {
-        let start = self.items.len();
-        self.items.extend(iter);
-        if self.items.len() > start {
-            Some(Idx::from_raw(start))
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if `idx` points to a valid item in this arena.
-    ///
-    /// An index becomes invalid after [`rollback`](Arena::rollback) or
-    /// [`reset`](Arena::reset) removes the item it pointed to.
+    /// Returns whether `idx` is currently valid for this arena.
     #[must_use]
-    pub const fn is_valid(&self, idx: Idx<T>) -> bool {
-        idx.into_raw() < self.items.len()
+    pub fn is_valid(&self, idx: Idx<T>) -> bool {
+        self.stamps.get(idx.slot()).copied() == Some(idx.stamp())
     }
 
-    /// Returns a reference to the value at `idx`, or `None` if the
-    /// index is out of bounds.
+    /// Returns the referenced value, or `None` for a foreign or stale index.
     #[must_use]
     pub fn try_get(&self, idx: Idx<T>) -> Option<&T> {
-        self.items.get(idx.into_raw())
+        if !self.is_valid(idx) {
+            return None;
+        }
+        self.items.get(idx.slot())
     }
 
-    /// Returns a mutable reference to the value at `idx`, or `None`
-    /// if the index is out of bounds.
+    /// Returns the referenced mutable value, or `None` for a foreign or stale
+    /// index.
     #[must_use]
     pub fn try_get_mut(&mut self, idx: Idx<T>) -> Option<&mut T> {
-        self.items.get_mut(idx.into_raw())
+        if self.stamps.get(idx.slot()).copied() != Some(idx.stamp()) {
+            return None;
+        }
+        self.items.get_mut(idx.slot())
     }
 
-    /// Removes all items, returning an iterator that yields them
-    /// in allocation order.
+    /// Removes all values and yields them in allocation order.
     ///
-    /// The arena is empty after the iterator is consumed or dropped.
-    /// Capacity is retained.
-    pub fn drain(&mut self) -> std::vec::Drain<'_, T> {
-        self.items.drain(..)
+    /// The arena becomes empty immediately; dropping this iterator drops any
+    /// remaining yielded values. Capacity is retained by both backing vectors.
+    pub fn drain(&mut self) -> ArenaDrain<'_, T> {
+        self.stamps.clear();
+        ArenaDrain::new(self.items.drain(..))
     }
 
-    /// Returns an iterator yielding `(Idx<T>, &T)` pairs in allocation order.
+    /// Iterates over `(Idx<T>, &T)` pairs in allocation order.
     #[must_use]
     pub fn iter_indexed(&self) -> IterIndexed<'_, T> {
-        IterIndexed::new(self.items.iter().enumerate())
+        IterIndexed::new(self.stamps.iter(), self.items.iter())
     }
 
-    /// Returns a mutable iterator yielding `(Idx<T>, &mut T)` pairs in
-    /// allocation order.
+    /// Mutably iterates over `(Idx<T>, &mut T)` pairs in allocation order.
     pub fn iter_indexed_mut(&mut self) -> IterIndexedMut<'_, T> {
-        IterIndexedMut::new(self.items.iter_mut().enumerate())
+        IterIndexedMut::new(self.stamps.iter(), self.items.iter_mut())
     }
 
-    /// Reserves capacity for at least `additional` more items.
+    /// Reserves capacity for at least `additional` more values and stamps.
     pub fn reserve(&mut self, additional: usize) {
         self.items.reserve(additional);
+        self.stamps.reserve(additional);
     }
 
-    /// Shrinks the backing storage to fit the current number of items.
+    /// Shrinks both backing vectors to fit the live prefix.
     pub fn shrink_to_fit(&mut self) {
         self.items.shrink_to_fit();
+        self.stamps.shrink_to_fit();
+    }
+
+    fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
+        if checkpoint.owner() != self.owner {
+            return Err(CheckpointError::ForeignArena);
+        }
+        if checkpoint.len() > self.len() {
+            return Err(CheckpointError::BeyondCurrent {
+                checkpoint_len: checkpoint.len(),
+                current_len: self.len(),
+            });
+        }
+        let current_tail = checkpoint
+            .len()
+            .checked_sub(1)
+            .and_then(|slot| self.stamps.get(slot).copied());
+        if current_tail != checkpoint.tail() {
+            return Err(CheckpointError::DivergedPrefix {
+                checkpoint_len: checkpoint.len(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -228,23 +307,23 @@ impl<'a, T> IntoIterator for &'a mut Arena<T> {
 
 impl<T> Extend<T> for Arena<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.items.extend(iter);
+        let _ = self.alloc_block(iter);
     }
 }
 
 impl<T> std::iter::FromIterator<T> for Arena<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self {
-            items: iter.into_iter().collect(),
-        }
+        let mut arena = Self::new();
+        let _ = arena.alloc_block(iter);
+        arena
     }
 }
 
 impl<T> IntoIterator for Arena<T> {
     type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
+    type IntoIter = ArenaIntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter()
+        ArenaIntoIter::new(self.items.into_iter())
     }
 }

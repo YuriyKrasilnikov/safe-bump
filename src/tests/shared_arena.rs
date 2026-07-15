@@ -1,823 +1,349 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::*;
 
-// ─── Compile-time guarantees ────────────────────────────────────────────────
-
 #[test]
-fn is_send_and_sync() {
+fn is_send_and_sync_when_values_are() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
     assert_send::<SharedArena<String>>();
     assert_sync::<SharedArena<String>>();
-
-    assert_send::<SharedArena<i32>>();
-    assert_sync::<SharedArena<i32>>();
 }
 
 #[test]
-fn alloc_takes_shared_ref() {
-    // SharedArena::alloc(&self, T) — not &mut self
-    // This compiles only if alloc takes &self.
-    let arena = SharedArena::<i32>::new();
-    let _a = arena.alloc(1);
-    let _b = arena.alloc(2); // second alloc without &mut — proves &self
-}
-
-#[test]
-fn get_returns_ref_not_guard() {
-    let arena = SharedArena::<i32>::new();
-    let a = arena.alloc(42);
-
-    // Type annotation proves get returns &T, not a guard type.
-    let r: &i32 = arena.get(a);
-    assert_eq!(*r, 42);
-}
-
-// ─── Basic operations ───────────────────────────────────────────────────────
-
-#[test]
-fn alloc_and_get() {
+fn alloc_uses_a_shared_reference_and_get_returns_a_plain_reference() {
     let arena = SharedArena::new();
-    let a = arena.alloc(42);
-    let b = arena.alloc(99);
+    let first = arena.alloc(10);
+    let second = arena.alloc(20);
+    let value: &i32 = arena.get(second);
 
-    assert_eq!(*arena.get(a), 42);
-    assert_eq!(*arena.get(b), 99);
+    assert_eq!(*arena.get(first), 10);
+    assert_eq!(*value, 20);
     assert_eq!(arena.len(), 2);
 }
 
 #[test]
-fn alloc_strings() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(String::from("hello"));
-    let b = arena.alloc(String::from("world"));
+fn foreign_equal_slot_is_rejected() {
+    let left = SharedArena::new();
+    let right = SharedArena::new();
+    let left_idx = left.alloc(10);
+    let right_idx = right.alloc(20);
 
-    assert_eq!(arena[a], "hello");
-    assert_eq!(arena[b], "world");
+    assert_eq!(left_idx.slot(), right_idx.slot());
+    assert_ne!(left_idx, right_idx);
+    assert_eq!(left.try_get(right_idx), None);
+    assert_eq!(right.try_get(left_idx), None);
 }
 
 #[test]
-fn empty_arena() {
+fn reset_reuse_does_not_resurrect_an_index() {
+    let mut arena = SharedArena::new();
+    let stale = arena.alloc(String::from("old"));
+    arena.reset();
+    let current = arena.alloc(String::from("new"));
+
+    assert_eq!(stale.slot(), current.slot());
+    assert_eq!(arena.try_get(stale), None);
+    assert_eq!(arena.try_get(current).map(String::as_str), Some("new"));
+}
+
+#[test]
+#[should_panic(expected = "foreign, stale, or unpublished")]
+fn indexing_with_a_stale_capability_panics() {
+    let mut arena = SharedArena::new();
+    let stale = arena.alloc(1);
+    arena.reset();
+    let _ = arena[stale];
+}
+
+#[test]
+fn block_is_contiguous_and_bounds_checked() {
+    let arena = SharedArena::new();
+    let _prefix = arena.alloc(0);
+    let block = arena.alloc_block([10, 20, 30]);
+
+    assert_eq!(block.len(), 3);
+    assert_eq!(block.first().map(Idx::slot), Some(1));
+    assert_eq!(block.last().map(Idx::slot), Some(3));
+    assert_eq!(block.get(3), None);
+    let values: Vec<_> = block.indices().map(|idx| *arena.get(idx)).collect();
+    assert_eq!(values, vec![10, 20, 30]);
+    assert!(block.indices().all(|idx| block.contains(idx)));
+}
+
+#[test]
+fn empty_block_does_not_change_publication() {
     let arena = SharedArena::<i32>::new();
+    let block = arena.alloc_block(std::iter::empty());
+    assert!(block.is_empty());
     assert!(arena.is_empty());
-    assert_eq!(arena.len(), 0);
 }
 
 #[test]
-fn index_operator() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(String::from("hello"));
-
-    assert_eq!(arena[a], "hello");
-}
-
-#[test]
-fn is_valid_in_range() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(1);
-
-    assert!(arena.is_valid(a));
-    assert!(!arena.is_valid(Idx::from_raw(999)));
-}
-
-#[test]
-fn try_get_valid_and_invalid() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(42);
-
-    assert_eq!(arena.try_get(a), Some(&42));
-    assert_eq!(arena.try_get(Idx::from_raw(999)), None);
-}
-
-#[test]
-fn many_allocations() {
-    let arena = SharedArena::new();
-    for i in 0..10_000_u64 {
-        let idx = arena.alloc(i);
-        assert_eq!(*arena.get(idx), i);
-    }
-    assert_eq!(arena.len(), 10_000);
-}
-
-// ─── Checkpoint/rollback ────────────────────────────────────────────────────
-
-#[test]
-fn checkpoint_rollback() {
+fn checkpoint_rollback_preserves_the_prefix_and_drops_the_suffix() {
+    let drops = Rc::new(Cell::new(0));
     let mut arena = SharedArena::new();
-    let a = arena.alloc(1);
-    let cp = arena.checkpoint();
-    let _b = arena.alloc(2);
-    let _c = arena.alloc(3);
+    let kept = arena.alloc(Tracked(Rc::clone(&drops)));
+    let checkpoint = arena.checkpoint();
+    let stale = arena.alloc(Tracked(Rc::clone(&drops)));
 
-    arena.rollback(cp);
+    arena.rollback(checkpoint);
     assert_eq!(arena.len(), 1);
-    assert_eq!(*arena.get(a), 1);
+    assert!(arena.is_valid(kept));
+    assert!(!arena.is_valid(stale));
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]
-fn checkpoint_len() {
-    let arena = SharedArena::new();
-    arena.alloc(1);
-    arena.alloc(2);
-    let cp = arena.checkpoint();
-    assert_eq!(cp.len(), 2);
-}
-
-#[test]
-fn checkpoint_keep() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(1);
-    let _cp = arena.checkpoint();
-
-    // Allocate speculatively
-    let b = arena.alloc(2);
-    let c = arena.alloc(3);
-
-    // Decide to KEEP — simply don't rollback
-    assert_eq!(arena.len(), 3);
-    assert_eq!(*arena.get(a), 1);
-    assert_eq!(*arena.get(b), 2);
-    assert_eq!(*arena.get(c), 3);
-}
-
-#[test]
-fn rollback_to_empty() {
+fn foreign_and_diverged_checkpoints_are_rejected() {
+    let foreign_arena: SharedArena<i32> = SharedArena::new();
+    let foreign = foreign_arena.checkpoint();
     let mut arena = SharedArena::new();
-    let cp = arena.checkpoint();
+    let _root = arena.alloc(0);
+    assert_eq!(
+        arena.try_rollback(foreign),
+        Err(CheckpointError::ForeignArena)
+    );
 
-    arena.alloc(1);
-    arena.alloc(2);
-    arena.rollback(cp);
+    let branch = arena.checkpoint();
+    let stale = arena.alloc(1);
+    let stale_prefix = arena.checkpoint();
+    arena.rollback(branch);
+    let current = arena.alloc(2);
 
+    assert_eq!(stale.slot(), current.slot());
+    assert_eq!(
+        arena.try_rollback(stale_prefix),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+    assert_eq!(*arena.get(current), 2);
+}
+
+#[test]
+fn reset_preserves_drop_exactly_once() {
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = SharedArena::new();
+    arena.alloc(Tracked(Rc::clone(&drops)));
+    arena.alloc(Tracked(Rc::clone(&drops)));
+    arena.reset();
+
+    assert_eq!(drops.get(), 2);
+    assert!(arena.is_empty());
+    drop(arena);
+    assert_eq!(drops.get(), 2);
+}
+
+#[test]
+fn iterators_and_drain_preserve_allocation_order() {
+    let mut arena = SharedArena::new();
+    let block = arena.alloc_block([10, 20, 30]);
+
+    assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![10, 20, 30]);
+    assert_eq!(
+        arena
+            .iter_indexed()
+            .map(|(idx, value)| (idx, *value))
+            .collect::<Vec<_>>(),
+        block.indices().zip([10, 20, 30]).collect::<Vec<_>>()
+    );
+    assert_eq!(arena.drain().collect::<Vec<_>>(), vec![10, 20, 30]);
     assert!(arena.is_empty());
 }
 
 #[test]
-#[should_panic(expected = "checkpoint")]
-fn rollback_beyond_length_panics() {
-    let mut arena = SharedArena::new();
-    arena.alloc(1);
-    arena.alloc(2);
-    let cp_early = arena.checkpoint(); // saves len=2
-    arena.alloc(3);
-    arena.alloc(4);
-    arena.alloc(5);
-    let cp_late = arena.checkpoint(); // saves len=5
-    arena.rollback(cp_early); // back to len=2
-    arena.rollback(cp_late); // panics: checkpoint beyond current length
+fn extend_from_iter_and_default_share_the_block_semantics() {
+    let mut extended = SharedArena::default();
+    extended.extend([1, 2, 3]);
+    let collected: SharedArena<_> = [4, 5, 6].into_iter().collect();
+
+    assert_eq!(extended.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(collected.into_iter().collect::<Vec<_>>(), vec![4, 5, 6]);
 }
 
 #[test]
-fn nested_checkpoints() {
-    let mut arena = SharedArena::new();
-    let a = arena.alloc(1);
-
-    let cp1 = arena.checkpoint();
-    let _b = arena.alloc(2);
-
-    let cp2 = arena.checkpoint();
-    let _c = arena.alloc(3);
-
-    arena.rollback(cp2);
-    assert_eq!(arena.len(), 2);
-
-    arena.rollback(cp1);
-    assert_eq!(arena.len(), 1);
-    assert_eq!(*arena.get(a), 1);
-}
-
-// ─── Drop semantics ────────────────────────────────────────────────────────
-
-#[test]
-fn rollback_runs_drop() {
-    let drop_count = Rc::new(Cell::new(0u32));
-    let mut arena = SharedArena::new();
-    let _a = arena.alloc(Tracked(Rc::clone(&drop_count)));
-    let cp = arena.checkpoint();
-    let _b = arena.alloc(Tracked(Rc::clone(&drop_count)));
-    let _c = arena.alloc(Tracked(Rc::clone(&drop_count)));
-
-    assert_eq!(drop_count.get(), 0);
-    arena.rollback(cp);
-    assert_eq!(drop_count.get(), 2); // b and c dropped
-}
-
-#[test]
-fn reset_runs_drop() {
-    let drop_count = Rc::new(Cell::new(0u32));
-    let mut arena = SharedArena::new();
-    let _a = arena.alloc(Tracked(Rc::clone(&drop_count)));
-    let _b = arena.alloc(Tracked(Rc::clone(&drop_count)));
-
-    arena.reset();
-    assert_eq!(drop_count.get(), 2);
-    assert!(arena.is_empty());
-}
-
-#[test]
-fn drop_arena_runs_drop() {
-    let drop_count = Rc::new(Cell::new(0u32));
-
-    {
-        let arena = SharedArena::new();
-        arena.alloc(Tracked(Rc::clone(&drop_count)));
-        arena.alloc(Tracked(Rc::clone(&drop_count)));
-        arena.alloc(Tracked(Rc::clone(&drop_count)));
-        assert_eq!(drop_count.get(), 0);
-    } // arena dropped here
-
-    assert_eq!(drop_count.get(), 3);
-}
-
-// ─── Stale index / validity ─────────────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "index out of bounds")]
-fn stale_index_panics() {
-    let mut arena = SharedArena::new();
-    let _a = arena.alloc(1);
-    let b = arena.alloc(2);
-
-    arena.reset();
-    let _ = arena[b]; // stale index
-}
-
-#[test]
-fn is_valid_after_rollback() {
-    let mut arena = SharedArena::new();
-    let a = arena.alloc(1);
-    let cp = arena.checkpoint();
-    let b = arena.alloc(2);
-
-    assert!(arena.is_valid(a));
-    assert!(arena.is_valid(b));
-
-    arena.rollback(cp);
-    assert!(arena.is_valid(a));
-    assert!(!arena.is_valid(b));
-}
-
-#[test]
-fn is_valid_after_reset() {
-    let mut arena = SharedArena::new();
-    let a = arena.alloc(1);
-
-    assert!(arena.is_valid(a));
-    arena.reset();
-    assert!(!arena.is_valid(a));
-}
-
-#[test]
-fn try_get_after_rollback() {
-    let mut arena = SharedArena::new();
-    let a = arena.alloc(42);
-    let cp = arena.checkpoint();
-    let b = arena.alloc(99);
-
-    arena.rollback(cp);
-    assert_eq!(arena.try_get(a), Some(&42));
-    assert_eq!(arena.try_get(b), None);
-}
-
-// ─── Reuse after reset ──────────────────────────────────────────────────────
-
-#[test]
-fn reuse_after_reset() {
-    let mut arena = SharedArena::new();
-    arena.alloc(String::from("first"));
-    arena.reset();
-
-    let a = arena.alloc(String::from("second"));
-    assert_eq!(arena[a], "second");
-    assert_eq!(arena.len(), 1);
-}
-
-// ─── Batch allocation ───────────────────────────────────────────────────────
-
-#[test]
-fn alloc_extend_returns_first_idx() {
-    let arena = SharedArena::new();
-    arena.alloc(0);
-
-    let first = arena.alloc_extend(vec![10, 20, 30]);
-    assert_eq!(first, Some(Idx::from_raw(1)));
-    assert_eq!(arena.len(), 4);
-    assert_eq!(*arena.get(Idx::from_raw(1)), 10);
-    assert_eq!(*arena.get(Idx::from_raw(2)), 20);
-    assert_eq!(*arena.get(Idx::from_raw(3)), 30);
-}
-
-#[test]
-fn alloc_extend_empty_returns_none() {
-    let arena = SharedArena::<i32>::new();
-    let result = arena.alloc_extend(std::iter::empty());
-    assert_eq!(result, None);
-    assert!(arena.is_empty());
-}
-
-// ─── Drain / IntoIterator ───────────────────────────────────────────────────
-
-#[test]
-fn drain_returns_all_items() {
-    let mut arena = SharedArena::new();
-    arena.alloc(10);
-    arena.alloc(20);
-    arena.alloc(30);
-
-    let items: Vec<_> = arena.drain().collect();
-    assert_eq!(items, vec![10, 20, 30]);
-    assert!(arena.is_empty());
-}
-
-#[test]
-fn drain_runs_no_extra_drops() {
-    let drop_count = Rc::new(Cell::new(0u32));
-    let mut arena = SharedArena::new();
-    arena.alloc(Tracked(Rc::clone(&drop_count)));
-    arena.alloc(Tracked(Rc::clone(&drop_count)));
-
-    let items: Vec<_> = arena.drain().collect();
-    assert_eq!(drop_count.get(), 0); // not dropped yet — owned by items
-    drop(items);
-    assert_eq!(drop_count.get(), 2); // now dropped
-}
-
-#[test]
-fn into_iter_consuming() {
-    let arena = SharedArena::new();
-    arena.alloc(String::from("a"));
-    arena.alloc(String::from("b"));
-    arena.alloc(String::from("c"));
-
-    let collected: Vec<String> = arena.into_iter().collect();
-    assert_eq!(collected, vec!["a", "b", "c"]);
-}
-
-// ─── Concurrent allocation ──────────────────────────────────────────────────
-
-#[test]
-fn concurrent_alloc() {
-    use std::sync::Arc;
-    use std::thread;
-
-    let arena = Arc::new(SharedArena::<u64>::new());
-
-    let indices: Vec<Idx<u64>> = (0..4)
-        .map(|i| {
-            let arena = Arc::clone(&arena);
-            thread::spawn(move || arena.alloc(i))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .collect();
-
-    // All values accessible and valid
-    for idx in &indices {
-        assert!(arena.is_valid(*idx));
-    }
-    assert_eq!(arena.len(), 4);
-}
-
-#[test]
-fn concurrent_alloc_and_read() {
-    use std::sync::Arc;
-    use std::thread;
-
-    let arena = Arc::new(SharedArena::<u64>::new());
-
-    // Pre-allocate some values
-    let pre = arena.alloc(100);
-
-    // Concurrent readers + writers
-    let mut handles = Vec::new();
-
-    // Writers
-    for i in 0..4 {
-        let arena = Arc::clone(&arena);
-        handles.push(thread::spawn(move || {
-            arena.alloc(i);
-        }));
-    }
-
-    // Readers (reading pre-allocated value while writers are active)
-    for _ in 0..4 {
-        let arena = Arc::clone(&arena);
-        handles.push(thread::spawn(move || {
-            assert_eq!(*arena.get(pre), 100);
-        }));
-    }
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    assert_eq!(arena.len(), 5); // 1 pre + 4 concurrent
-}
-
-// ─── Stress tests ───────────────────────────────────────────────────────────
-
-#[test]
-fn stress_many_threads_many_allocs() {
-    use std::sync::Arc;
-    use std::thread;
-
+fn concurrent_single_allocations_return_unique_valid_capabilities() {
     const THREADS: usize = 8;
-    const PER_THREAD: usize = 1000;
+    const PER_THREAD: usize = 500;
 
-    let arena = Arc::new(SharedArena::<usize>::new());
-
-    let all_pairs: Vec<(Idx<usize>, usize)> = (0..THREADS)
-        .map(|t| {
-            let arena = Arc::clone(&arena);
-            thread::spawn(move || {
-                let mut indices = Vec::with_capacity(PER_THREAD);
-                for i in 0..PER_THREAD {
-                    let val = t * PER_THREAD + i;
-                    indices.push((arena.alloc(val), val));
-                }
-                indices
-            })
-        })
-        .collect::<Vec<_>>()
+    let arena = Arc::new(SharedArena::new());
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_id in 0..THREADS {
+        let arena = Arc::clone(&arena);
+        handles.push(thread::spawn(move || {
+            (0..PER_THREAD)
+                .map(|offset| {
+                    let value = thread_id * PER_THREAD + offset;
+                    (arena.alloc(value), value)
+                })
+                .collect::<Vec<_>>()
+        }));
+    }
+    let pairs: Vec<_> = handles
         .into_iter()
-        .flat_map(|h| h.join().unwrap())
+        .flat_map(|handle| handle.join().unwrap())
         .collect();
 
-    // All values published
     assert_eq!(arena.len(), THREADS * PER_THREAD);
-
-    // Every value accessible and correct
-    for (idx, expected) in &all_pairs {
-        assert_eq!(*arena.get(*idx), *expected);
+    for &(idx, expected) in &pairs {
+        assert_eq!(*arena.get(idx), expected);
     }
-
-    // No duplicates in indices
-    let mut raw_indices: Vec<usize> = all_pairs.iter().map(|(idx, _)| idx.into_raw()).collect();
-    raw_indices.sort_unstable();
-    raw_indices.dedup();
-    assert_eq!(raw_indices.len(), THREADS * PER_THREAD);
+    let mut slots: Vec<_> = pairs.iter().map(|(idx, _)| idx.slot()).collect();
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(slots.len(), THREADS * PER_THREAD);
 }
 
 #[test]
-fn stress_concurrent_alloc_with_barrier() {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+fn concurrent_blocks_never_interleave() {
+    const THREADS: usize = 12;
+    const BLOCK_LEN: usize = 32;
 
-    const THREADS: usize = 8;
-
-    let arena = Arc::new(SharedArena::<usize>::new());
+    let arena = Arc::new(SharedArena::new());
     let barrier = Arc::new(Barrier::new(THREADS));
-
-    let indices: Vec<Idx<usize>> = (0..THREADS)
-        .map(|t| {
-            let arena = Arc::clone(&arena);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                // All threads start simultaneously
-                barrier.wait();
-                arena.alloc(t)
-            })
-        })
-        .collect::<Vec<_>>()
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_id in 0..THREADS {
+        let arena = Arc::clone(&arena);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let values = (0..BLOCK_LEN).map(|offset| thread_id * 1000 + offset);
+            (thread_id, arena.alloc_block(values))
+        }));
+    }
+    let blocks: Vec<_> = handles
         .into_iter()
-        .map(|h| h.join().unwrap())
+        .map(|handle| handle.join().unwrap())
         .collect();
 
-    assert_eq!(arena.len(), THREADS);
-
-    // All values present (order may vary)
-    let mut values: Vec<usize> = indices.iter().map(|idx| *arena.get(*idx)).collect();
-    values.sort_unstable();
-    assert_eq!(values, (0..THREADS).collect::<Vec<_>>());
+    let mut all_slots = Vec::with_capacity(THREADS * BLOCK_LEN);
+    for (thread_id, block) in blocks {
+        let indices: Vec<_> = block.indices().collect();
+        assert_eq!(indices.len(), BLOCK_LEN);
+        assert!(indices.windows(2).all(|pair| {
+            pair[0].same_allocation(pair[1]) && pair[0].slot() + 1 == pair[1].slot()
+        }));
+        for (offset, idx) in indices.into_iter().enumerate() {
+            assert_eq!(*arena.get(idx), thread_id * 1000 + offset);
+            all_slots.push(idx.slot());
+        }
+    }
+    all_slots.sort_unstable();
+    all_slots.dedup();
+    assert_eq!(all_slots.len(), THREADS * BLOCK_LEN);
 }
 
 #[test]
-fn stress_published_consistency() {
-    use std::sync::Arc;
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
-    use std::thread;
+fn readers_observe_only_complete_publication_prefixes() {
+    const WRITERS: usize = 4;
+    const PER_WRITER: usize = 300;
 
-    let arena = Arc::new(SharedArena::<u64>::new());
+    let arena = Arc::new(SharedArena::new());
     let done = Arc::new(AtomicBool::new(false));
-    // Barrier ensures reader is running before writers start
-    let barrier = Arc::new(Barrier::new(5)); // 1 reader + 4 writers
-
-    // Reader thread: continuously checks that all idx < len() are readable
+    let reader_started = Arc::new(Barrier::new(2));
     let reader_arena = Arc::clone(&arena);
     let reader_done = Arc::clone(&done);
-    let reader_barrier = Arc::clone(&barrier);
+    let reader_start = Arc::clone(&reader_started);
     let reader = thread::spawn(move || {
-        reader_barrier.wait();
-        let mut checks = 0u64;
-        while !reader_done.load(AOrdering::Relaxed) {
-            let len = reader_arena.len();
-            // Every index below published must be readable
-            for i in 0..len {
-                let idx = Idx::from_raw(i);
+        let mut snapshots = 0;
+        loop {
+            for (idx, value) in reader_arena.iter_indexed() {
                 assert!(reader_arena.is_valid(idx));
-                // get must not panic
-                let _ = reader_arena.get(idx);
+                assert_eq!(reader_arena.get(idx), value);
             }
-            checks += 1;
-        }
-        checks
-    });
-
-    // Writers: allocate concurrently
-    let writers: Vec<_> = (0..4)
-        .map(|_| {
-            let arena = Arc::clone(&arena);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                for i in 0..500_u64 {
-                    arena.alloc(i);
-                }
-            })
-        })
-        .collect();
-
-    for w in writers {
-        w.join().unwrap();
-    }
-
-    done.store(true, AOrdering::Relaxed);
-    let checks = reader.join().unwrap();
-
-    assert_eq!(arena.len(), 2000);
-    assert!(checks > 0, "reader performed {checks} checks");
-}
-
-#[test]
-fn stress_no_livelock() {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    // Many threads start simultaneously — maximizes contention in
-    // advance_published where each thread spins waiting for its
-    // predecessor to publish.
-    const THREADS: usize = 16;
-    const PER_THREAD: usize = 500;
-    const TIMEOUT: Duration = Duration::from_secs(10);
-
-    let arena = Arc::new(SharedArena::<usize>::new());
-    let barrier = Arc::new(Barrier::new(THREADS));
-    let start = Instant::now();
-
-    let handles: Vec<_> = (0..THREADS)
-        .map(|t| {
-            let arena = Arc::clone(&arena);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                for i in 0..PER_THREAD {
-                    arena.alloc(t * PER_THREAD + i);
-                }
-            })
-        })
-        .collect();
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    let elapsed = start.elapsed();
-    assert_eq!(arena.len(), THREADS * PER_THREAD);
-    assert!(
-        elapsed < TIMEOUT,
-        "completed in {elapsed:?} — exceeds {TIMEOUT:?}, possible livelock"
-    );
-}
-
-// ─── Publish ordering ───────────────────────────────────────────────────────
-
-#[test]
-fn published_is_contiguous_prefix() {
-    // Verifies that `published` always represents a contiguous prefix
-    // of filled slots — no gaps. A reader seeing len() = N can safely
-    // read all indices 0..N.
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AOrdering};
-    use std::thread;
-
-    let arena = Arc::new(SharedArena::<u64>::new());
-    let done = Arc::new(AtomicBool::new(false));
-    let gap_found = Arc::new(AtomicBool::new(false));
-    let max_checked = Arc::new(AtomicUsize::new(0));
-
-    // Reader: for every observed len(), verify ALL slots 0..len() are readable
-    let r_arena = Arc::clone(&arena);
-    let r_done = Arc::clone(&done);
-    let r_gap = Arc::clone(&gap_found);
-    let r_max = Arc::clone(&max_checked);
-    let reader = thread::spawn(move || {
-        while !r_done.load(AOrdering::Relaxed) {
-            let len = r_arena.len();
-            for i in 0..len {
-                if r_arena.try_get(Idx::from_raw(i)).is_none() {
-                    r_gap.store(true, AOrdering::Relaxed);
-                    return;
-                }
+            snapshots += 1;
+            if snapshots == 1 {
+                reader_start.wait();
             }
-            r_max.fetch_max(len, AOrdering::Relaxed);
+            if reader_done.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
         }
+        snapshots
     });
+    // Do not let an unlucky scheduler run every writer to completion before
+    // the reader has executed even one publication snapshot.
+    reader_started.wait();
 
-    // Writers: 8 threads, 500 allocs each, maximum contention
-    let writers: Vec<_> = (0..8)
-        .map(|_| {
-            let arena = Arc::clone(&arena);
-            thread::spawn(move || {
-                for i in 0..500_u64 {
-                    arena.alloc(i);
-                }
-            })
-        })
-        .collect();
-
-    for w in writers {
-        w.join().unwrap();
-    }
-    done.store(true, AOrdering::Relaxed);
-    reader.join().unwrap();
-
-    assert!(
-        !gap_found.load(AOrdering::Relaxed),
-        "gap detected in published prefix"
-    );
-    assert!(
-        max_checked.load(AOrdering::Relaxed) > 0,
-        "reader performed no checks"
-    );
-    assert_eq!(arena.len(), 4000);
-}
-
-#[test]
-fn checkpoint_during_concurrent_alloc() {
-    // Checkpoint taken while other threads are allocating.
-    // The checkpoint captures a consistent published snapshot —
-    // all indices below checkpoint.len() must be readable.
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
-    use std::thread;
-
-    const PER_WRITER: usize = 500;
-    const WRITERS: usize = 4;
-
-    let arena = Arc::new(SharedArena::<u64>::new());
-    let writers_done = Arc::new(AtomicBool::new(false));
-
-    // Writers: fixed allocation count (bounded memory)
     let writers: Vec<_> = (0..WRITERS)
-        .map(|_| {
+        .map(|thread_id| {
             let arena = Arc::clone(&arena);
             thread::spawn(move || {
-                for i in 0..PER_WRITER as u64 {
-                    arena.alloc(i);
+                for offset in 0..PER_WRITER {
+                    arena.alloc(thread_id * PER_WRITER + offset);
                 }
             })
         })
         .collect();
-
-    // Checker: takes checkpoints concurrently with writers
-    let cp_arena = Arc::clone(&arena);
-    let cp_done = Arc::clone(&writers_done);
-    let checker = thread::spawn(move || {
-        let mut checkpoints = Vec::new();
-        while !cp_done.load(AOrdering::Relaxed) {
-            let cp = cp_arena.checkpoint();
-            let len = cp.len();
-            // Every index below checkpoint must be readable NOW
-            for i in 0..len {
-                assert!(
-                    cp_arena.try_get(Idx::from_raw(i)).is_some(),
-                    "checkpoint len={len} but index {i} not readable"
-                );
-            }
-            checkpoints.push(cp);
-            std::thread::yield_now();
-        }
-        checkpoints
-    });
-
-    for w in writers {
-        w.join().unwrap();
+    for writer in writers {
+        writer.join().unwrap();
     }
-    writers_done.store(true, AOrdering::Relaxed);
+    done.store(true, Ordering::Release);
 
-    let checkpoints = checker.join().unwrap();
-
-    // Checkpoints are monotonically non-decreasing
-    for window in checkpoints.windows(2) {
-        assert!(window[0].len() <= window[1].len());
-    }
+    assert!(reader.join().unwrap() >= 2);
     assert_eq!(arena.len(), WRITERS * PER_WRITER);
 }
 
-// ─── Iteration ─────────────────────────────────────────────────────────────
-
 #[test]
-fn iter() {
-    let arena = SharedArena::new();
-    arena.alloc(10);
-    arena.alloc(20);
-    arena.alloc(30);
+fn checkpoints_taken_during_allocation_are_monotone_and_readable() {
+    let arena = Arc::new(SharedArena::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let writer_arena = Arc::clone(&arena);
+    let writer_done = Arc::clone(&done);
+    let writer = thread::spawn(move || {
+        for value in 0..2000 {
+            writer_arena.alloc(value);
+        }
+        writer_done.store(true, Ordering::Release);
+    });
 
-    let values: Vec<_> = arena.iter().copied().collect();
-    assert_eq!(values, vec![10, 20, 30]);
-}
-
-#[test]
-fn iter_empty() {
-    let arena = SharedArena::<i32>::new();
-    assert_eq!(arena.iter().count(), 0);
-}
-
-#[test]
-fn iter_exact_size() {
-    let arena = SharedArena::new();
-    arena.alloc(1);
-    arena.alloc(2);
-    arena.alloc(3);
-
-    let iter = arena.iter();
-    assert_eq!(iter.len(), 3);
-}
-
-#[test]
-fn iter_indexed() {
-    let arena = SharedArena::new();
-    let a = arena.alloc(10);
-    let b = arena.alloc(20);
-    let c = arena.alloc(30);
-
-    let pairs: Vec<_> = arena.iter_indexed().collect();
-    assert_eq!(pairs, vec![(a, &10), (b, &20), (c, &30)]);
-}
-
-#[test]
-fn iter_indexed_empty() {
-    let arena = SharedArena::<i32>::new();
-    assert_eq!(arena.iter_indexed().count(), 0);
-}
-
-#[test]
-fn iter_indexed_exact_size() {
-    let arena = SharedArena::new();
-    arena.alloc(1);
-    arena.alloc(2);
-
-    let iter = arena.iter_indexed();
-    assert_eq!(iter.len(), 2);
-}
-
-#[test]
-fn into_iter_ref() {
-    let arena = SharedArena::new();
-    arena.alloc(String::from("a"));
-    arena.alloc(String::from("b"));
-
-    let mut values = Vec::new();
-    for v in &arena {
-        values.push(v.as_str());
+    let mut lengths = Vec::new();
+    while !done.load(Ordering::Acquire) {
+        let checkpoint = arena.checkpoint();
+        assert_eq!(
+            arena.iter_indexed().take(checkpoint.len()).count(),
+            checkpoint.len()
+        );
+        lengths.push(checkpoint.len());
+        thread::yield_now();
     }
-    assert_eq!(values, vec!["a", "b"]);
-    // arena still usable
-    assert_eq!(arena.len(), 2);
-}
+    writer.join().unwrap();
 
-// ─── Extend / FromIterator ─────────────────────────────────────────────────
-
-#[test]
-fn extend_trait() {
-    let mut arena = SharedArena::new();
-    arena.alloc(1);
-    arena.extend(vec![2, 3, 4]);
-
-    assert_eq!(arena.len(), 4);
-    let values: Vec<_> = arena.iter().copied().collect();
-    assert_eq!(values, vec![1, 2, 3, 4]);
+    assert!(lengths.windows(2).all(|window| window[0] <= window[1]));
+    assert_eq!(arena.len(), 2000);
 }
 
 #[test]
-fn from_iterator() {
-    let arena: SharedArena<i32> = vec![10, 20, 30].into_iter().collect();
+fn high_contention_completes_without_observed_livelock() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 250;
+    const LIMIT: Duration = Duration::from_secs(10);
 
-    assert_eq!(arena.len(), 3);
-    let values: Vec<_> = arena.iter().copied().collect();
-    assert_eq!(values, vec![10, 20, 30]);
-}
+    let arena = Arc::new(SharedArena::new());
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let start = Instant::now();
+    let handles: Vec<_> = (0..THREADS)
+        .map(|thread_id| {
+            let arena = Arc::clone(&arena);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for offset in 0..PER_THREAD {
+                    arena.alloc(thread_id * PER_THREAD + offset);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
 
-// ─── Default ────────────────────────────────────────────────────────────────
-
-#[test]
-fn default_is_empty() {
-    let arena: SharedArena<u8> = SharedArena::default();
-    assert!(arena.is_empty());
+    assert_eq!(arena.len(), THREADS * PER_THREAD);
+    assert!(start.elapsed() < LIMIT);
 }

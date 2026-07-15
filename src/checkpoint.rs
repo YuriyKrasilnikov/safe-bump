@@ -1,37 +1,47 @@
 use std::marker::PhantomData;
 
-/// Saved allocation state for rollback.
+use crate::stamp::Stamp;
+
+/// Saved allocation prefix for validated rollback.
 ///
-/// Created by [`Arena::checkpoint`](crate::Arena::checkpoint) or
-/// [`SharedArena::checkpoint`](crate::SharedArena::checkpoint). Rolling back
-/// to a checkpoint drops all values allocated after it and retains everything
-/// before.
+/// Checkpoints can only be created by an arena. Besides the prefix length,
+/// they carry the arena identity and the stamp of the prefix tail. This rejects
+/// foreign checkpoints and the equal-length ABA case after a prefix was
+/// discarded and replaced.
 pub struct Checkpoint<T> {
+    owner: Stamp,
     len: usize,
-    _marker: PhantomData<T>,
+    tail: Option<Stamp>,
+    marker: PhantomData<fn() -> T>,
 }
 
 impl<T> Checkpoint<T> {
-    /// Creates a checkpoint from a saved length.
-    ///
-    /// The caller must ensure the length is valid for the target arena.
-    #[must_use]
-    pub const fn from_len(len: usize) -> Self {
+    pub(crate) const fn new(owner: Stamp, len: usize, tail: Option<Stamp>) -> Self {
         Self {
+            owner,
             len,
-            _marker: PhantomData,
+            tail,
+            marker: PhantomData,
         }
     }
 
-    /// Returns the saved length.
+    pub(crate) const fn owner(self) -> Stamp {
+        self.owner
+    }
+
+    pub(crate) const fn tail(self) -> Option<Stamp> {
+        self.tail
+    }
+
+    /// Returns the saved prefix length.
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub const fn len(self) -> usize {
         self.len
     }
 
-    /// Returns `true` if the checkpoint was taken at an empty state.
+    /// Returns `true` when the saved prefix is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub const fn is_empty(self) -> bool {
         self.len == 0
     }
 }
@@ -46,7 +56,7 @@ impl<T> Copy for Checkpoint<T> {}
 
 impl<T> PartialEq for Checkpoint<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len
+        self.owner == other.owner && self.len == other.len && self.tail == other.tail
     }
 }
 
@@ -54,13 +64,19 @@ impl<T> Eq for Checkpoint<T> {}
 
 impl<T> std::hash::Hash for Checkpoint<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
         self.len.hash(state);
+        self.tail.hash(state);
     }
 }
 
 impl<T> std::fmt::Debug for Checkpoint<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Checkpoint({})", self.len)
+        f.debug_struct("Checkpoint")
+            .field("owner", &self.owner.get())
+            .field("len", &self.len)
+            .field("tail", &self.tail.map(Stamp::get))
+            .finish()
     }
 }
 
@@ -72,6 +88,46 @@ impl<T> PartialOrd for Checkpoint<T> {
 
 impl<T> Ord for Checkpoint<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.len.cmp(&other.len)
+        (self.owner, self.len, self.tail).cmp(&(other.owner, other.len, other.tail))
     }
 }
+
+/// Reason a checkpoint cannot be applied to the current allocation prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointError {
+    /// The checkpoint was created by a different arena.
+    ForeignArena,
+    /// The checkpoint names a prefix longer than the current allocation state.
+    BeyondCurrent {
+        /// Saved checkpoint length.
+        checkpoint_len: usize,
+        /// Current arena length.
+        current_len: usize,
+    },
+    /// The slot at the saved boundary was discarded and later replaced.
+    DivergedPrefix {
+        /// Saved checkpoint length.
+        checkpoint_len: usize,
+    },
+}
+
+impl std::fmt::Display for CheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForeignArena => f.write_str("checkpoint belongs to a different arena"),
+            Self::BeyondCurrent {
+                checkpoint_len,
+                current_len,
+            } => write!(
+                f,
+                "checkpoint length {checkpoint_len} exceeds current length {current_len}"
+            ),
+            Self::DivergedPrefix { checkpoint_len } => write!(
+                f,
+                "checkpoint prefix of length {checkpoint_len} has been replaced"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointError {}
