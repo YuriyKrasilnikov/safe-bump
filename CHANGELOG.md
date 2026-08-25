@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the minimum supported Rust version from 1.93 to 1.96.
+
 ## [0.3.0] - 2026-07-15
 
 ### Added

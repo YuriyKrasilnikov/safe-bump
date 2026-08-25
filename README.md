@@ -8,6 +8,8 @@ validated checkpoint rollback.
 `safe-bump` contains no `unsafe` code and enforces that property with
 `#![forbid(unsafe_code)]`.
 
+The minimum supported Rust version is 1.96.
+
 ## Why the handles are capabilities
 
 A raw vector offset is not enough to identify an arena value. The same offset
