@@ -24,7 +24,7 @@ confidence intervals remain marginal estimates; the report does not construct
 or claim a paired ratio confidence interval.
 
 The `raw_pairs` binary executes the closed `paired-workloads.tsv` matrix in
-balanced AB/BA order and emits exact pair IDs, execution positions, versions,
+alternating AB/BA order and emits exact pair IDs, execution positions, versions,
 positive elapsed nanoseconds, and deterministic content witnesses. The paired
 matrix separates allocation with reserved capacity, allocation with growth,
 empty arena creation, and capacity reservation so their costs cannot mask one

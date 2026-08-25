@@ -179,7 +179,7 @@ Criterion writes its local report under `target/criterion`. The GitHub
 full run on `main`, version tags, a weekly schedule, and manual dispatch. Each
 full run publishes current and cross-version Criterion reports, a diagnostic
 point-ratio table carrying each function's separate marginal confidence
-interval, balanced AB/BA raw observations with content witnesses, console
+interval, alternating AB/BA raw observations with content witnesses, console
 output, and a runner passport. The workflow deliberately does not claim a
 paired confidence interval or a performance winner from one hosted run.
 

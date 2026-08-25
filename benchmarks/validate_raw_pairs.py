@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed structural validation for balanced release observations."""
+"""Fail-closed structural validation for alternating-order release observations."""
 
 from __future__ import annotations
 

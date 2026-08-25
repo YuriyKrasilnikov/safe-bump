@@ -160,7 +160,7 @@ jobs:
               --phase 2/6 |
             tee benchmark-output-release-comparison.txt
 
-      - name: "[3/6] Record balanced raw pairs"
+      - name: "[3/6] Record alternating raw pairs"
         run: >-
           CARGO_TARGET_DIR="${PWD}/target/release-comparison"
           cargo +1.96.0 run --locked --release
@@ -206,7 +206,7 @@ jobs:
             cat benchmarks/release-comparison/QUALITY.md
             echo
             echo "The complete Criterion report and runner passport are attached as the \`safe-bump-benchmarks-${GITHUB_SHA}\` artifact."
-            echo "Balanced AB/BA raw observations are attached as \`benchmark-raw-pairs.tsv\`; this workflow does not claim a performance winner."
+            echo "Alternating AB/BA raw observations are attached as \`benchmark-raw-pairs.tsv\`; this workflow does not claim a performance winner."
             echo
             echo "<details><summary>Current-version Criterion console output</summary>"
             echo

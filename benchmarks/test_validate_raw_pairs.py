@@ -69,7 +69,7 @@ class RawPairValidationTests(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_complete_balanced_pairs_pass(self) -> None:
+    def test_complete_alternating_pairs_pass(self) -> None:
         result = self.validate(self.rows())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("raw_pair_pairs=2", result.stdout)

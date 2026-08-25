@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reservation; name the execution order `baseline-candidate` and
   `candidate-baseline`, refuse zero-length intervals in the runner and the
   validator, and validate a two-repetition raw-pair file on pull requests.
+- Describe the raw-pair execution order as alternating AB/BA rather than
+  balanced: an odd repetition count leaves one more AB pair than BA.
 
 ## [0.3.0] - 2026-07-15
 
