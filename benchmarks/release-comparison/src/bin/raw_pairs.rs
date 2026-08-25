@@ -2,17 +2,20 @@ use std::hint::black_box;
 use std::thread;
 use std::time::Instant;
 
-use safe_bump_current::{Arena as CurrentArena, SharedArena as CurrentSharedArena};
-use safe_bump_release_comparison::{parameters, workloads};
-use safe_bump_v2::{Arena as PreviousArena, SharedArena as PreviousSharedArena};
+// Baseline is safe-bump v0.2.1; candidate is the current working version.
+use safe_bump_current::{Arena as CandidateArena, SharedArena as CandidateSharedArena};
+use safe_bump_release_comparison::{paired_parameters, paired_workloads};
+use safe_bump_v2::{Arena as BaselineArena, SharedArena as BaselineSharedArena};
 
 const WARMUPS: usize = 2;
 const DEFAULT_REPETITIONS: usize = 15;
 const TOTAL_SHARED_ITEMS: usize = 65_536;
+const BASELINE_LABEL: &str = "v0.2.1";
+const CANDIDATE_LABEL: &str = "v0.3.0";
 
 #[derive(Clone, Copy)]
 struct Observation {
-    elapsed_ns: u128,
+    elapsed_ns: u64,
     witness: u64,
 }
 
@@ -25,7 +28,7 @@ struct Progress {
 impl Progress {
     fn new(repetitions: usize) -> Self {
         Self {
-            expected: workloads(),
+            expected: paired_workloads(),
             completed_workloads: 0,
             repetitions,
         }
@@ -75,6 +78,16 @@ impl Progress {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).expect("benchmark size fits u64")
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    let elapsed = u64::try_from(started.elapsed().as_nanos())
+        .expect("benchmark interval fits u64 nanoseconds");
+    assert!(
+        elapsed > 0,
+        "zero-length benchmark interval: the clock cannot resolve this observation"
+    );
+    elapsed
 }
 
 fn repetitions() -> usize {
@@ -130,7 +143,7 @@ fn shared_content_witness(values: impl IntoIterator<Item = u64>) -> u64 {
 fn timed<T>(operation: impl FnOnce() -> T, witness: impl FnOnce(&T) -> u64) -> Observation {
     let started = Instant::now();
     let value = black_box(operation());
-    let elapsed_ns = started.elapsed().as_nanos();
+    let elapsed_ns = elapsed_ns(started);
     Observation {
         elapsed_ns,
         witness: witness(&value),
@@ -157,20 +170,20 @@ fn run_pairs(
     group: &str,
     parameter: usize,
     repetitions: usize,
-    mut previous: impl FnMut() -> Observation,
-    mut current: impl FnMut() -> Observation,
+    mut baseline: impl FnMut() -> Observation,
+    mut candidate: impl FnMut() -> Observation,
 ) {
     progress.begin_workload(group, parameter);
     for _ in 0..WARMUPS {
-        black_box(previous());
-        black_box(current());
+        black_box(baseline());
+        black_box(candidate());
     }
 
     for repetition in 0..repetitions {
         let pair_id = format!("{group}:{parameter}:{repetition}");
         if repetition % 2 == 0 {
-            let before = previous();
-            let after = current();
+            let before = baseline();
+            let after = candidate();
             assert_eq!(
                 before.witness, after.witness,
                 "content witness mismatch for {pair_id}"
@@ -179,23 +192,23 @@ fn run_pairs(
                 group,
                 parameter,
                 repetition,
-                "previous-current",
+                "baseline-candidate",
                 0,
-                "v0.2.1",
+                BASELINE_LABEL,
                 before,
             );
             emit(
                 group,
                 parameter,
                 repetition,
-                "previous-current",
+                "baseline-candidate",
                 1,
-                "v0.3.0",
+                CANDIDATE_LABEL,
                 after,
             );
         } else {
-            let before = current();
-            let after = previous();
+            let before = candidate();
+            let after = baseline();
             assert_eq!(
                 before.witness, after.witness,
                 "content witness mismatch for {pair_id}"
@@ -204,18 +217,18 @@ fn run_pairs(
                 group,
                 parameter,
                 repetition,
-                "current-previous",
+                "candidate-baseline",
                 0,
-                "v0.3.0",
+                CANDIDATE_LABEL,
                 before,
             );
             emit(
                 group,
                 parameter,
                 repetition,
-                "current-previous",
+                "candidate-baseline",
                 1,
-                "v0.2.1",
+                BASELINE_LABEL,
                 after,
             );
         }
@@ -224,36 +237,128 @@ fn run_pairs(
     progress.complete_workload();
 }
 
-fn allocation(progress: &mut Progress, repetitions: usize) {
-    let group = "release/allocation";
-    for size in parameters(group) {
+fn allocation_no_growth(progress: &mut Progress, repetitions: usize) {
+    let group = "release/allocation_no_growth";
+    for size in paired_parameters(group) {
         run_pairs(
             progress,
             group,
             size,
             repetitions,
             || {
+                let mut arena = BaselineArena::with_capacity(size);
+                let started = Instant::now();
+                for value in 0..size {
+                    black_box(arena.alloc(usize_to_u64(value)));
+                }
+                let elapsed_ns = elapsed_ns(started);
+                Observation {
+                    elapsed_ns,
+                    witness: ordered_witness(arena.len(), arena.iter().copied()),
+                }
+            },
+            || {
+                let mut arena = CandidateArena::with_capacity(size);
+                let started = Instant::now();
+                for value in 0..size {
+                    black_box(arena.alloc(usize_to_u64(value)));
+                }
+                let elapsed_ns = elapsed_ns(started);
+                Observation {
+                    elapsed_ns,
+                    witness: ordered_witness(arena.len(), arena.iter().copied()),
+                }
+            },
+        );
+    }
+}
+
+fn allocation_growth(progress: &mut Progress, repetitions: usize) {
+    let group = "release/allocation_growth";
+    for size in paired_parameters(group) {
+        run_pairs(
+            progress,
+            group,
+            size,
+            repetitions,
+            || {
+                let mut arena = BaselineArena::new();
+                let started = Instant::now();
+                for value in 0..size {
+                    black_box(arena.alloc(usize_to_u64(value)));
+                }
+                let elapsed_ns = elapsed_ns(started);
+                Observation {
+                    elapsed_ns,
+                    witness: ordered_witness(arena.len(), arena.iter().copied()),
+                }
+            },
+            || {
+                let mut arena = CandidateArena::new();
+                let started = Instant::now();
+                for value in 0..size {
+                    black_box(arena.alloc(usize_to_u64(value)));
+                }
+                let elapsed_ns = elapsed_ns(started);
+                Observation {
+                    elapsed_ns,
+                    witness: ordered_witness(arena.len(), arena.iter().copied()),
+                }
+            },
+        );
+    }
+}
+
+fn arena_creation(progress: &mut Progress, repetitions: usize) {
+    let group = "release/arena_creation";
+    for count in paired_parameters(group) {
+        run_pairs(
+            progress,
+            group,
+            count,
+            repetitions,
+            || {
+                let started = Instant::now();
+                let arenas: Vec<BaselineArena<u64>> =
+                    (0..count).map(|_| BaselineArena::new()).collect();
+                black_box(&arenas);
+                Observation {
+                    elapsed_ns: elapsed_ns(started),
+                    witness: usize_to_u64(arenas.len()),
+                }
+            },
+            || {
+                let started = Instant::now();
+                let arenas: Vec<CandidateArena<u64>> =
+                    (0..count).map(|_| CandidateArena::new()).collect();
+                black_box(&arenas);
+                Observation {
+                    elapsed_ns: elapsed_ns(started),
+                    witness: usize_to_u64(arenas.len()),
+                }
+            },
+        );
+    }
+}
+
+fn arena_with_capacity(progress: &mut Progress, repetitions: usize) {
+    let group = "release/arena_with_capacity";
+    for capacity in paired_parameters(group) {
+        run_pairs(
+            progress,
+            group,
+            capacity,
+            repetitions,
+            || {
                 timed(
-                    || {
-                        let mut arena = PreviousArena::with_capacity(size);
-                        for value in 0..size {
-                            black_box(arena.alloc(usize_to_u64(value)));
-                        }
-                        arena
-                    },
-                    |arena| ordered_witness(arena.len(), arena.iter().copied()),
+                    || BaselineArena::<u64>::with_capacity(capacity),
+                    |arena| usize_to_u64(arena.capacity()),
                 )
             },
             || {
                 timed(
-                    || {
-                        let mut arena = CurrentArena::with_capacity(size);
-                        for value in 0..size {
-                            black_box(arena.alloc(usize_to_u64(value)));
-                        }
-                        arena
-                    },
-                    |arena| ordered_witness(arena.len(), arena.iter().copied()),
+                    || CandidateArena::<u64>::with_capacity(capacity),
+                    |arena| usize_to_u64(arena.capacity()),
                 )
             },
         );
@@ -262,27 +367,25 @@ fn allocation(progress: &mut Progress, repetitions: usize) {
 
 fn validated_lookup(progress: &mut Progress, repetitions: usize) {
     let group = "release/validated_lookup";
-    for size in parameters(group) {
-        let mut previous = PreviousArena::with_capacity(size);
-        let previous_indices: Vec<_> = (0..size)
-            .map(|value| previous.alloc(usize_to_u64(value)))
+    for size in paired_parameters(group) {
+        let mut baseline = BaselineArena::with_capacity(size);
+        let baseline_indices: Vec<_> = (0..size)
+            .map(|value| baseline.alloc(usize_to_u64(value)))
             .collect();
-        let mut current = CurrentArena::with_capacity(size);
-        let current_indices: Vec<_> = (0..size)
-            .map(|value| current.alloc(usize_to_u64(value)))
+        let mut candidate = CandidateArena::with_capacity(size);
+        let candidate_indices: Vec<_> = (0..size)
+            .map(|value| candidate.alloc(usize_to_u64(value)))
             .collect();
-        let previous_witness = ordered_witness(
-            previous_indices.len(),
-            previous_indices
-                .iter()
-                .map(|index| *previous.get(*index)),
+        let baseline_witness = ordered_witness(
+            baseline_indices.len(),
+            baseline_indices.iter().map(|index| *baseline.get(*index)),
         );
-        let current_witness = ordered_witness(
-            current_indices.len(),
-            current_indices.iter().map(|index| *current.get(*index)),
+        let candidate_witness = ordered_witness(
+            candidate_indices.len(),
+            candidate_indices.iter().map(|index| *candidate.get(*index)),
         );
         assert_eq!(
-            previous_witness, current_witness,
+            baseline_witness, candidate_witness,
             "lookup fixtures differ across versions"
         );
         let expected_checksum = (0..usize_to_u64(size)).fold(0_u64, u64::wrapping_add);
@@ -294,28 +397,28 @@ fn validated_lookup(progress: &mut Progress, repetitions: usize) {
             || {
                 timed(
                     || {
-                        black_box(previous_indices.as_slice())
+                        black_box(baseline_indices.as_slice())
                             .iter()
-                            .map(|index| *previous.get(*index))
+                            .map(|index| *baseline.get(*index))
                             .fold(0_u64, u64::wrapping_add)
                     },
                     |checksum| {
                         assert_eq!(*checksum, expected_checksum);
-                        previous_witness
+                        baseline_witness
                     },
                 )
             },
             || {
                 timed(
                     || {
-                        black_box(current_indices.as_slice())
+                        black_box(candidate_indices.as_slice())
                             .iter()
-                            .map(|index| *current.get(*index))
+                            .map(|index| *candidate.get(*index))
                             .fold(0_u64, u64::wrapping_add)
                     },
                     |checksum| {
                         assert_eq!(*checksum, expected_checksum);
-                        current_witness
+                        candidate_witness
                     },
                 )
             },
@@ -325,13 +428,13 @@ fn validated_lookup(progress: &mut Progress, repetitions: usize) {
 
 fn iteration(progress: &mut Progress, repetitions: usize) {
     let group = "release/iteration";
-    for size in parameters(group) {
-        let previous: PreviousArena<u64> = (0..usize_to_u64(size)).collect();
-        let current: CurrentArena<u64> = (0..usize_to_u64(size)).collect();
-        let previous_witness = ordered_witness(previous.len(), previous.iter().copied());
-        let current_witness = ordered_witness(current.len(), current.iter().copied());
+    for size in paired_parameters(group) {
+        let baseline: BaselineArena<u64> = (0..usize_to_u64(size)).collect();
+        let candidate: CandidateArena<u64> = (0..usize_to_u64(size)).collect();
+        let baseline_witness = ordered_witness(baseline.len(), baseline.iter().copied());
+        let candidate_witness = ordered_witness(candidate.len(), candidate.iter().copied());
         assert_eq!(
-            previous_witness, current_witness,
+            baseline_witness, candidate_witness,
             "iteration fixtures differ across versions"
         );
         let expected_checksum = (0..usize_to_u64(size)).fold(0_u64, u64::wrapping_add);
@@ -342,19 +445,19 @@ fn iteration(progress: &mut Progress, repetitions: usize) {
             repetitions,
             || {
                 timed(
-                    || previous.iter().copied().fold(0_u64, u64::wrapping_add),
+                    || baseline.iter().copied().fold(0_u64, u64::wrapping_add),
                     |checksum| {
                         assert_eq!(*checksum, expected_checksum);
-                        previous_witness
+                        baseline_witness
                     },
                 )
             },
             || {
                 timed(
-                    || current.iter().copied().fold(0_u64, u64::wrapping_add),
+                    || candidate.iter().copied().fold(0_u64, u64::wrapping_add),
                     |checksum| {
                         assert_eq!(*checksum, expected_checksum);
-                        current_witness
+                        candidate_witness
                     },
                 )
             },
@@ -364,9 +467,9 @@ fn iteration(progress: &mut Progress, repetitions: usize) {
 
 fn speculative_rollback(progress: &mut Progress, repetitions: usize) {
     let group = "release/speculative_rollback";
-    for suffix_len in parameters(group) {
-        let mut previous: PreviousArena<u64> = (0..1_024_u64).collect();
-        let mut current: CurrentArena<u64> = (0..1_024_u64).collect();
+    for suffix_len in paired_parameters(group) {
+        let mut baseline: BaselineArena<u64> = (0..1_024_u64).collect();
+        let mut candidate: CandidateArena<u64> = (0..1_024_u64).collect();
         run_pairs(
             progress,
             group,
@@ -374,28 +477,28 @@ fn speculative_rollback(progress: &mut Progress, repetitions: usize) {
             repetitions,
             || {
                 let started = Instant::now();
-                let checkpoint = previous.checkpoint();
+                let checkpoint = baseline.checkpoint();
                 for value in 0..suffix_len {
-                    black_box(previous.alloc(usize_to_u64(value)));
+                    black_box(baseline.alloc(usize_to_u64(value)));
                 }
-                previous.rollback(checkpoint);
-                let elapsed_ns = started.elapsed().as_nanos();
+                baseline.rollback(checkpoint);
+                let elapsed_ns = elapsed_ns(started);
                 Observation {
                     elapsed_ns,
-                    witness: ordered_witness(previous.len(), previous.iter().copied()),
+                    witness: ordered_witness(baseline.len(), baseline.iter().copied()),
                 }
             },
             || {
                 let started = Instant::now();
-                let checkpoint = current.checkpoint();
+                let checkpoint = candidate.checkpoint();
                 for value in 0..suffix_len {
-                    black_box(current.alloc(usize_to_u64(value)));
+                    black_box(candidate.alloc(usize_to_u64(value)));
                 }
-                current.rollback(checkpoint);
-                let elapsed_ns = started.elapsed().as_nanos();
+                candidate.rollback(checkpoint);
+                let elapsed_ns = elapsed_ns(started);
                 Observation {
                     elapsed_ns,
-                    witness: ordered_witness(current.len(), current.iter().copied()),
+                    witness: ordered_witness(candidate.len(), candidate.iter().copied()),
                 }
             },
         );
@@ -404,7 +507,7 @@ fn speculative_rollback(progress: &mut Progress, repetitions: usize) {
 
 fn concurrent_allocation(progress: &mut Progress, repetitions: usize) {
     let group = "release/shared_concurrent_allocation";
-    for thread_count in parameters(group) {
+    for thread_count in paired_parameters(group) {
         run_pairs(
             progress,
             group,
@@ -413,7 +516,7 @@ fn concurrent_allocation(progress: &mut Progress, repetitions: usize) {
             || {
                 timed(
                     || {
-                        let arena = PreviousSharedArena::new();
+                        let arena = BaselineSharedArena::new();
                         thread::scope(|scope| {
                             for thread_id in 0..thread_count {
                                 let arena = &arena;
@@ -435,7 +538,7 @@ fn concurrent_allocation(progress: &mut Progress, repetitions: usize) {
             || {
                 timed(
                     || {
-                        let arena = CurrentSharedArena::new();
+                        let arena = CandidateSharedArena::new();
                         thread::scope(|scope| {
                             for thread_id in 0..thread_count {
                                 let arena = &arena;
@@ -461,11 +564,14 @@ fn concurrent_allocation(progress: &mut Progress, repetitions: usize) {
 fn main() {
     let repetitions = repetitions();
     let mut progress = Progress::new(repetitions);
-    println!("safe-bump-raw-pairs-v1");
+    println!("safe-bump-paired-raw-v2");
     println!(
         "pair_id\tgroup\tparameter\trepetition\torder\tposition\tversion\telapsed_ns\twitness"
     );
-    allocation(&mut progress, repetitions);
+    allocation_no_growth(&mut progress, repetitions);
+    allocation_growth(&mut progress, repetitions);
+    arena_creation(&mut progress, repetitions);
+    arena_with_capacity(&mut progress, repetitions);
     validated_lookup(&mut progress, repetitions);
     iteration(&mut progress, repetitions);
     speculative_rollback(&mut progress, repetitions);

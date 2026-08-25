@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 pub const WORKLOAD_MANIFEST: &str = include_str!("../workloads.tsv");
+pub const PAIRED_WORKLOAD_MANIFEST: &str = include_str!("../paired-workloads.tsv");
 
 pub fn parameters(group: &str) -> Vec<usize> {
     let selected: Vec<_> = workloads()
@@ -17,10 +18,23 @@ pub fn workloads() -> Vec<(&'static str, usize)> {
     workloads_from_manifest(WORKLOAD_MANIFEST, "safe-bump-release-workloads-v1")
 }
 
-fn workloads_from_manifest<'a>(
-    manifest: &'a str,
-    expected_header: &str,
-) -> Vec<(&'a str, usize)> {
+pub fn paired_parameters(group: &str) -> Vec<usize> {
+    let selected: Vec<_> = paired_workloads()
+        .into_iter()
+        .filter_map(|(row_group, parameter)| (row_group == group).then_some(parameter))
+        .collect();
+    assert!(
+        !selected.is_empty(),
+        "paired workload group is absent: {group}"
+    );
+    selected
+}
+
+pub fn paired_workloads() -> Vec<(&'static str, usize)> {
+    workloads_from_manifest(PAIRED_WORKLOAD_MANIFEST, "safe-bump-paired-workloads-v2")
+}
+
+fn workloads_from_manifest<'a>(manifest: &'a str, expected_header: &str) -> Vec<(&'a str, usize)> {
     let mut lines = manifest.lines();
     assert_eq!(
         lines.next(),
@@ -76,6 +90,25 @@ mod tests {
         }
         assert_eq!(workloads().len(), 16);
         assert_eq!(WORKLOAD_MANIFEST.lines().count(), 17);
+    }
+
+    #[test]
+    fn paired_manifest_separates_allocation_mechanisms_and_is_closed() {
+        let groups = [
+            ("release/allocation_no_growth", vec![64, 1_024, 65_536]),
+            ("release/allocation_growth", vec![64, 1_024, 65_536]),
+            ("release/arena_creation", vec![64, 1_024, 65_536]),
+            ("release/arena_with_capacity", vec![64, 1_024, 65_536]),
+            ("release/validated_lookup", vec![64, 1_024, 65_536]),
+            ("release/iteration", vec![64, 1_024, 65_536]),
+            ("release/speculative_rollback", vec![1, 64, 1_024]),
+            ("release/shared_concurrent_allocation", vec![1, 2, 4, 8]),
+        ];
+        for (group, expected) in groups {
+            assert_eq!(paired_parameters(group), expected, "group {group}");
+        }
+        assert_eq!(paired_workloads().len(), 25);
+        assert_eq!(PAIRED_WORKLOAD_MANIFEST.lines().count(), 26);
     }
 
     #[test]

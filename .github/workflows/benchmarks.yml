@@ -46,6 +46,12 @@ jobs:
       - name: Compile all benchmarks
         run: cargo +1.96.0 bench --locked --all-features --no-run
 
+      - name: Test current version on the MSRV toolchain
+        run: cargo +1.96.0 test --locked
+
+      - name: Test current version with all features on the MSRV toolchain
+        run: cargo +1.96.0 test --locked --all-features
+
       - name: Compile v0.2.1 to v0.3.0 comparison
         run: >-
           CARGO_TARGET_DIR=target/release-comparison
@@ -75,6 +81,25 @@ jobs:
 
       - name: Verify benchmark report contract
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
+      - name: Record a two-repetition smoke raw-pair file
+        run: >-
+          CARGO_TARGET_DIR=target/release-comparison
+          cargo +1.96.0 run --locked --release
+          --manifest-path benchmarks/release-comparison/Cargo.toml
+          --bin raw_pairs -- --repetitions 2
+          > benchmark-raw-pairs-smoke.tsv
+
+      - name: Validate the smoke raw-pair file
+        run: >-
+          python3 benchmarks/validate_raw_pairs.py
+          benchmark-raw-pairs-smoke.tsv
+          --manifest benchmarks/release-comparison/paired-workloads.tsv
+          --manifest-header safe-bump-paired-workloads-v2
+          --schema safe-bump-paired-raw-v2
+          --baseline v0.2.1
+          --candidate v0.3.0
+          --repetitions 2
 
   benchmark-run:
     name: Run and publish benchmarks
@@ -147,11 +172,11 @@ jobs:
         run: >-
           python3 benchmarks/validate_raw_pairs.py
           benchmark-raw-pairs.tsv
-          --manifest benchmarks/release-comparison/workloads.tsv
-          --manifest-header safe-bump-release-workloads-v1
-          --schema safe-bump-raw-pairs-v1
-          --previous v0.2.1
-          --current v0.3.0
+          --manifest benchmarks/release-comparison/paired-workloads.tsv
+          --manifest-header safe-bump-paired-workloads-v2
+          --schema safe-bump-paired-raw-v2
+          --baseline v0.2.1
+          --candidate v0.3.0
           --repetitions 15
 
       - name: "[5/6] Render release delta"

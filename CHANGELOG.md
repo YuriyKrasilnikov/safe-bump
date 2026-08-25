@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Raise the minimum supported Rust version from 1.93 to 1.96.
+- Record cross-version raw pairs under the `safe-bump-paired-raw-v2`
+  schema with a closed paired workload matrix that separates allocation
+  without growth, allocation with growth, arena creation and capacity
+  reservation; name the execution order `baseline-candidate` and
+  `candidate-baseline`, refuse zero-length intervals in the runner and the
+  validator, and validate a two-repetition raw-pair file on pull requests.
 
 ## [0.3.0] - 2026-07-15
 

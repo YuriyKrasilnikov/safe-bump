@@ -34,16 +34,16 @@ def main() -> int:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--manifest-header", required=True)
     parser.add_argument("--schema", required=True)
-    parser.add_argument("--previous", required=True)
-    parser.add_argument("--current", required=True)
+    parser.add_argument("--baseline", required=True)
+    parser.add_argument("--candidate", required=True)
     parser.add_argument("--repetitions", required=True, type=int)
     args = parser.parse_args()
 
     if args.repetitions <= 0:
         fail("repetitions must be positive")
-    if not args.previous or not args.current or args.previous == args.current:
-        fail("previous and current versions must be distinct and non-empty")
-    versions_under_test = (args.previous, args.current)
+    if not args.baseline or not args.candidate or args.baseline == args.candidate:
+        fail("baseline and candidate identities must be distinct and non-empty")
+    versions_under_test = (args.baseline, args.candidate)
     workloads = read_workload_manifest(args.manifest, args.manifest_header)
     lines = args.raw_pairs.read_text(encoding="utf-8").splitlines()
     if len(lines) < 2 or lines[0] != args.schema:
@@ -78,7 +78,7 @@ def main() -> int:
             fail(f"non-integer raw-pair field at line {line_number}")
         if repetition not in range(args.repetitions):
             fail(f"raw-pair repetition out of range at line {line_number}")
-        if position not in (0, 1) or elapsed < 0:
+        if position not in (0, 1) or elapsed <= 0:
             fail(f"invalid position or elapsed value at line {line_number}")
         if version not in versions_under_test:
             fail(f"unexpected raw-pair version at line {line_number}: {version}")
@@ -87,7 +87,9 @@ def main() -> int:
         expected_pair_id = f"{group}:{parameter}:{repetition}"
         if pair_id != expected_pair_id:
             fail(f"raw-pair identity mismatch at line {line_number}")
-        expected_order = "previous-current" if repetition % 2 == 0 else "current-previous"
+        expected_order = (
+            "baseline-candidate" if repetition % 2 == 0 else "candidate-baseline"
+        )
         if order != expected_order:
             fail(f"raw-pair order mismatch at line {line_number}")
         versions = pairs.setdefault((group, parameter, repetition), {})
@@ -114,12 +116,15 @@ def main() -> int:
         versions = pairs[key]
         if set(versions) != set(versions_under_test):
             fail(f"incomplete raw pair: {key}: {sorted(versions)}")
-        previous_position, previous_witness, _ = versions[args.previous]
-        current_position, current_witness, _ = versions[args.current]
-        expected_previous_position = 0 if key[2] % 2 == 0 else 1
-        if previous_position != expected_previous_position or current_position == previous_position:
+        baseline_position, baseline_witness, _ = versions[args.baseline]
+        candidate_position, candidate_witness, _ = versions[args.candidate]
+        expected_baseline_position = 0 if key[2] % 2 == 0 else 1
+        if (
+            baseline_position != expected_baseline_position
+            or candidate_position == baseline_position
+        ):
             fail(f"raw-pair execution positions disagree with order: {key}")
-        if previous_witness != current_witness:
+        if baseline_witness != candidate_witness:
             fail(f"raw-pair content witness mismatch: {key}")
 
     expected_rows = len(expected_pairs) * 2

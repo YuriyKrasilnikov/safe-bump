@@ -21,7 +21,7 @@ class RawPairValidationTests(unittest.TestCase):
         self.manifest = self.scratch / "workloads.tsv"
         self.raw = self.scratch / "raw.tsv"
         self.manifest.write_text(
-            "safe-bump-release-workloads-v1\nrelease/allocation\t64\n",
+            "safe-bump-paired-workloads-v2\nrelease/allocation_no_growth\t64\n",
             encoding="utf-8",
         )
 
@@ -31,17 +31,17 @@ class RawPairValidationTests(unittest.TestCase):
     @staticmethod
     def header() -> list[str]:
         return [
-            "safe-bump-raw-pairs-v1",
+            "safe-bump-paired-raw-v2",
             "pair_id\tgroup\tparameter\trepetition\torder\tposition\tversion\telapsed_ns\twitness",
         ]
 
     @staticmethod
     def rows() -> list[str]:
         return [
-            "release/allocation:64:0\trelease/allocation\t64\t0\tprevious-current\t0\tv0.2.1\t100\t0123456789abcdef",
-            "release/allocation:64:0\trelease/allocation\t64\t0\tprevious-current\t1\tv0.3.0\t80\t0123456789abcdef",
-            "release/allocation:64:1\trelease/allocation\t64\t1\tcurrent-previous\t0\tv0.3.0\t81\tfedcba9876543210",
-            "release/allocation:64:1\trelease/allocation\t64\t1\tcurrent-previous\t1\tv0.2.1\t101\tfedcba9876543210",
+            "release/allocation_no_growth:64:0\trelease/allocation_no_growth\t64\t0\tbaseline-candidate\t0\tv0.2.1\t100\t0123456789abcdef",
+            "release/allocation_no_growth:64:0\trelease/allocation_no_growth\t64\t0\tbaseline-candidate\t1\tv0.3.0\t80\t0123456789abcdef",
+            "release/allocation_no_growth:64:1\trelease/allocation_no_growth\t64\t1\tcandidate-baseline\t0\tv0.3.0\t81\tfedcba9876543210",
+            "release/allocation_no_growth:64:1\trelease/allocation_no_growth\t64\t1\tcandidate-baseline\t1\tv0.2.1\t101\tfedcba9876543210",
         ]
 
     def validate(self, rows: list[str]) -> subprocess.CompletedProcess[str]:
@@ -54,12 +54,12 @@ class RawPairValidationTests(unittest.TestCase):
                 "--manifest",
                 str(self.manifest),
                 "--manifest-header",
-                "safe-bump-release-workloads-v1",
+                "safe-bump-paired-workloads-v2",
                 "--schema",
-                "safe-bump-raw-pairs-v1",
-                "--previous",
+                "safe-bump-paired-raw-v2",
+                "--baseline",
                 "v0.2.1",
-                "--current",
+                "--candidate",
                 "v0.3.0",
                 "--repetitions",
                 "2",
@@ -91,6 +91,20 @@ class RawPairValidationTests(unittest.TestCase):
         result = self.validate(rows)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("content witness mismatch", result.stderr)
+
+    def test_zero_elapsed_observation_is_rejected(self) -> None:
+        rows = self.rows()
+        rows[0] = rows[0].replace("\t100\t", "\t0\t")
+        result = self.validate(rows)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid position or elapsed", result.stderr)
+
+    def test_order_vocabulary_drift_is_rejected(self) -> None:
+        rows = self.rows()
+        rows[0] = rows[0].replace("baseline-candidate", "previous-current")
+        result = self.validate(rows)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("raw-pair order mismatch", result.stderr)
 
 
 if __name__ == "__main__":

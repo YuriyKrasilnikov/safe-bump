@@ -23,9 +23,12 @@ workload for which both versions disappeared. Criterion's per-function
 confidence intervals remain marginal estimates; the report does not construct
 or claim a paired ratio confidence interval.
 
-The `raw_pairs` binary executes the same closed logical workload matrix in
+The `raw_pairs` binary executes the closed `paired-workloads.tsv` matrix in
 balanced AB/BA order and emits exact pair IDs, execution positions, versions,
-elapsed nanoseconds, and deterministic content witnesses:
+positive elapsed nanoseconds, and deterministic content witnesses. The paired
+matrix separates allocation with reserved capacity, allocation with growth,
+empty arena creation, and capacity reservation so their costs cannot mask one
+another:
 
 ```console
 cargo run --release --locked \
@@ -33,7 +36,10 @@ cargo run --release --locked \
   --bin raw_pairs -- --repetitions 15 > target/raw-pairs.tsv
 ```
 
-The runner aborts on a cross-version witness mismatch. Concurrent arena
+The raw matrix is intentionally distinct from the Criterion report matrix:
+Criterion remains a broad public diagnostic, while raw pairs preserve the
+execution relation needed by a controlled repeated analysis. The runner
+aborts on a cross-version witness mismatch. Concurrent arena
 publication order is scheduler-dependent, so that workload uses a
 permutation-invariant content witness while still verifying exact length and
 values. Witness construction is outside measured intervals; lookup and

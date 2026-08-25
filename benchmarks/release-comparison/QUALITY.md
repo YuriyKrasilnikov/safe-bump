@@ -15,7 +15,9 @@ to the property it buys. Root crate tests cover correctness and panic safety;
 benchmark timing does not replace those checks.
 
 Criterion's public table contains each function's marginal interval and a
-diagnostic point ratio only. Balanced raw observations carry pair identity,
-execution order, and content witnesses. A witness mismatch invalidates the
+diagnostic point ratio only. Balanced raw observations use a separate closed
+matrix that distinguishes allocation work from capacity growth and arena
+construction. They carry pair identity, execution order, and content
+witnesses. A witness mismatch or a non-positive duration invalidates the
 timing pair instead of comparing semantically different results; the workflow
 does not infer a performance winner from a single hosted run.
