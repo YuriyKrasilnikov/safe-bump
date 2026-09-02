@@ -601,6 +601,80 @@ fn equal_length_checkpoint_from_a_discarded_branch_is_rejected() {
 }
 
 #[test]
+fn validate_checkpoint_accepts_a_valid_checkpoint_without_mutating_the_arena() {
+    let mut arena = Arena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let checkpoint = arena.checkpoint();
+    arena.alloc(3);
+
+    assert_eq!(arena.validate_checkpoint(checkpoint), Ok(()));
+    assert_eq!(arena.len(), 3, "validation must not mutate the arena");
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_foreign_checkpoint() {
+    let left: Arena<i32> = Arena::new();
+    let foreign = left.checkpoint();
+    let right = Arena::<i32>::new();
+
+    assert_eq!(
+        right.validate_checkpoint(foreign),
+        Err(CheckpointError::ForeignArena)
+    );
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_checkpoint_beyond_current_length() {
+    let mut arena = Arena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let cp_early = arena.checkpoint(); // saves len=2
+    arena.alloc(3);
+    arena.alloc(4);
+    arena.alloc(5);
+    let cp_late = arena.checkpoint(); // saves len=5
+    arena.rollback(cp_early); // back to len=2
+
+    assert_eq!(
+        arena.validate_checkpoint(cp_late),
+        Err(CheckpointError::BeyondCurrent {
+            checkpoint_len: 5,
+            current_len: 2,
+        })
+    );
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_diverged_prefix() {
+    let mut arena = Arena::new();
+    let _root = arena.alloc(0);
+    let branch_point = arena.checkpoint();
+    let _stale = arena.alloc(1);
+    let stale_prefix = arena.checkpoint();
+    arena.rollback(branch_point);
+    let _replacement = arena.alloc(2);
+
+    assert_eq!(
+        arena.validate_checkpoint(stale_prefix),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+}
+
+#[test]
+fn validate_checkpoint_accepts_an_empty_arena_checkpoint_after_reset() {
+    let mut arena = Arena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    arena.reset();
+    let empty_checkpoint = arena.checkpoint();
+
+    assert_eq!(empty_checkpoint.len(), 0);
+    assert!(empty_checkpoint.tail().is_none());
+    assert_eq!(arena.validate_checkpoint(empty_checkpoint), Ok(()));
+}
+
+#[test]
 fn rollback_keeps_metadata_aligned_when_a_destructor_panics() {
     struct PanicOnce(Rc<Cell<bool>>);
 
@@ -628,4 +702,270 @@ fn rollback_keeps_metadata_aligned_when_a_destructor_panics() {
     arena.rollback(checkpoint);
     assert_eq!(arena.len(), 1);
     assert!(!arena.is_valid(first_suffix));
+}
+
+#[test]
+fn reset_with_a_panicking_drop_keeps_alignment_and_is_retryable() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic_on_drop, "intentional panic in Drop");
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Arena::new();
+    let kept = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    let panicking = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: true,
+    });
+    let last = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.reset()));
+    assert!(result.is_err());
+    assert_eq!(
+        drops.get(),
+        2,
+        "last and panicking are dropped from the end before the panic surfaces"
+    );
+    assert_eq!(arena.len(), 1);
+    assert!(arena.is_valid(kept));
+    assert!(!arena.is_valid(panicking));
+    assert!(!arena.is_valid(last));
+    assert_eq!(arena.iter_indexed().count(), 1);
+
+    arena.reset();
+    assert_eq!(drops.get(), 3);
+    assert!(arena.is_empty());
+
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    assert!(arena.is_valid(replacement));
+    assert!(!arena.is_valid(kept));
+    assert_eq!(replacement.slot(), kept.slot());
+}
+
+#[test]
+fn alloc_block_with_a_panicking_iterator_retains_prefix_and_capacity() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Arena::new();
+    let kept = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+    });
+    let capacity_before = arena.capacity();
+    let checkpoint = arena.checkpoint();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arena.alloc_block((0..5).map(|i| {
+            assert!(i != 3, "the input iterator panics partway through");
+            Tracked {
+                drops: Rc::clone(&drops),
+            }
+        }))
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(arena.len(), 1);
+    assert!(arena.is_valid(kept));
+    assert_eq!(arena.capacity(), capacity_before);
+    assert_eq!(
+        drops.get(),
+        3,
+        "the three collected values drop with the local buffer"
+    );
+    assert_eq!(arena.try_rollback(checkpoint), Ok(()));
+}
+
+#[test]
+fn drain_forgotten_leaks_without_a_double_drop() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Arena::new();
+    let old = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+    });
+    arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+    });
+
+    std::mem::forget(arena.drain());
+
+    assert_eq!(arena.len(), 0);
+    assert!(!arena.is_valid(old));
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+    });
+    assert!(arena.is_valid(replacement));
+    assert_eq!(arena.iter_indexed().count(), 1);
+    assert_eq!(
+        drops.get(),
+        0,
+        "forgetting the drain iterator leaks its values, matching std::mem::forget \
+         semantics, instead of dropping them twice"
+    );
+}
+
+#[test]
+fn drain_with_a_panicking_drop_keeps_alignment_and_is_retryable() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic_on_drop, "intentional panic in Drop");
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = Arena::new();
+    let panicking = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: true,
+    });
+    arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _drained = arena.drain();
+    }));
+    assert!(result.is_err());
+    assert_eq!(arena.len(), 0);
+    assert!(!arena.is_valid(panicking));
+    assert_eq!(
+        drops.get(),
+        2,
+        "both drained values are dropped exactly once"
+    );
+
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    assert!(arena.is_valid(replacement));
+    assert_eq!(arena.iter_indexed().count(), 1);
+}
+
+#[test]
+fn checkpoint_taken_before_drain_is_rejected_then_reported_as_diverged() {
+    let mut arena = Arena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let checkpoint = arena.checkpoint();
+    let _ = arena.drain().count();
+
+    assert_eq!(
+        arena.try_rollback(checkpoint),
+        Err(CheckpointError::BeyondCurrent {
+            checkpoint_len: 2,
+            current_len: 0,
+        })
+    );
+
+    arena.alloc(3);
+    arena.alloc(4);
+    assert_eq!(
+        arena.try_rollback(checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+    assert_eq!(arena.len(), 2);
+}
+
+#[test]
+fn same_allocation_holds_only_within_one_alloc_or_alloc_block_call() {
+    let mut arena = Arena::new();
+    let x = arena.alloc(1);
+    let y = arena.alloc(2);
+    let block = arena.alloc_block([3, 4]);
+
+    assert!(!x.same_allocation(y));
+    assert!(block.get(0).unwrap().same_allocation(block.get(1).unwrap()));
+    assert!(!x.same_allocation(block.get(0).unwrap()));
+}
+
+#[test]
+fn alloc_block_reentrant_iterator_through_a_refcell_hits_a_borrow_error() {
+    let cell = std::cell::RefCell::new(Arena::new());
+    cell.borrow_mut().alloc(0);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut guard = cell.borrow_mut();
+        let source = (0..3).inspect(|&i| {
+            if i == 1 {
+                // Would mutate the same arena through the iterator if the
+                // dynamic borrow allowed a second exclusive access here.
+                let _ = cell.borrow_mut();
+            }
+        });
+        let _ = guard.alloc_block(source);
+    }));
+
+    assert!(
+        result.is_err(),
+        "the reentrant borrow_mut panics with BorrowMutError"
+    );
+    assert_eq!(cell.borrow().len(), 1);
+}
+
+#[test]
+fn arena_creation_inside_a_tls_destructor_at_thread_exit_works() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static OK: AtomicBool = AtomicBool::new(false);
+
+    struct OnExit;
+
+    impl Drop for OnExit {
+        fn drop(&mut self) {
+            let mut arena = Arena::new();
+            let idx = arena.alloc(1);
+            if arena.is_valid(idx) {
+                OK.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    thread_local! {
+        static ON_EXIT: OnExit = const { OnExit };
+    }
+    std::thread::spawn(|| ON_EXIT.with(|_| {})).join().unwrap();
+
+    assert!(OK.load(Ordering::SeqCst));
 }

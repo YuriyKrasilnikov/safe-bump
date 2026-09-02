@@ -48,7 +48,13 @@ impl<T> Arena<T> {
     /// Allocates one contiguous batch and returns its block capability.
     ///
     /// The input is fully collected before arena state changes. If iteration
-    /// panics, the arena therefore retains its original prefix.
+    /// panics, the arena therefore retains its original prefix. This
+    /// guarantee covers the whole arena, not just this call's own effects,
+    /// which is stronger than what the `experimental-shared` arena can
+    /// promise for its equivalent method: this method borrows `self`
+    /// exclusively for its entire duration, so the borrow checker statically
+    /// excludes a reentrant caller-supplied iterator from holding another
+    /// reference to this same arena and mutating it before panicking.
     pub fn alloc_block(&mut self, iter: impl IntoIterator<Item = T>) -> Block<T> {
         let mut values: Vec<T> = iter.into_iter().collect();
         let len = values.len();
@@ -244,7 +250,31 @@ impl<T> Arena<T> {
         self.stamps.shrink_to_fit();
     }
 
-    fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
+    /// Validates `checkpoint` against this arena's current state without
+    /// changing the arena.
+    ///
+    /// Checks that `checkpoint` was created by this arena
+    /// ([`CheckpointError::ForeignArena`] otherwise), that its length does
+    /// not exceed the current length ([`CheckpointError::BeyondCurrent`]
+    /// otherwise), and that the stamp of the slot at `checkpoint.len() - 1`
+    /// still matches the stamp saved in the checkpoint
+    /// ([`CheckpointError::DivergedPrefix`] otherwise). `Ok(())` means that
+    /// [`rollback`](Self::rollback) or [`try_rollback`](Self::try_rollback)
+    /// with this checkpoint cannot fail *validation* right now: a panicking
+    /// destructor in the discarded suffix is still possible and is
+    /// documented under the `# Panics` sections of those methods.
+    ///
+    /// A caller holding several arenas can validate every checkpoint it
+    /// intends to roll back before mutating any of them, turning an
+    /// otherwise independent multi-arena rollback into an all-or-nothing
+    /// operation: once every checkpoint validates, none of the subsequent
+    /// `rollback` calls can fail with a [`CheckpointError`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError`] for a foreign checkpoint, a checkpoint
+    /// beyond the current length, or a historical prefix that was replaced.
+    pub fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
         if checkpoint.owner() != self.owner {
             return Err(CheckpointError::ForeignArena);
         }

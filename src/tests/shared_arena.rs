@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,69 @@ fn empty_block_does_not_change_publication() {
     assert!(arena.is_empty());
 }
 
+// Characterization test for why `alloc_block`'s panic guarantee is scoped to
+// its own reservation/publication rather than the whole arena: since
+// `SharedArena` takes `&self`, a caller-supplied iterator can reenter the
+// same arena and allocate before it panics, and that reentrant allocation
+// publishes immediately and is not undone by the later panic.
+#[test]
+fn alloc_block_reentrant_iterator_allocation_survives_the_input_panic() {
+    struct ReentrantThenPanic<'a> {
+        arena: &'a SharedArena<i32>,
+        recorded: Rc<Cell<Option<Idx<i32>>>>,
+        yielded: usize,
+    }
+
+    impl Iterator for ReentrantThenPanic<'_> {
+        type Item = i32;
+
+        fn next(&mut self) -> Option<i32> {
+            if self.yielded == 2 {
+                let reentrant = self.arena.alloc(999);
+                self.recorded.set(Some(reentrant));
+                panic!("input iterator panics after a reentrant allocation");
+            }
+            self.yielded += 1;
+            Some(10)
+        }
+    }
+
+    let arena = SharedArena::new();
+    let baseline = arena.alloc(0);
+    let recorded: Rc<Cell<Option<Idx<i32>>>> = Rc::new(Cell::new(None));
+    let source = ReentrantThenPanic {
+        arena: &arena,
+        recorded: Rc::clone(&recorded),
+        yielded: 0,
+    };
+
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.alloc_block(source)));
+
+    assert!(result.is_err(), "the input iterator was expected to panic");
+    let reentrant_idx = recorded
+        .get()
+        .expect("the iterator records its reentrant allocation before panicking");
+
+    // Only the baseline allocation and the iterator's own reentrant
+    // allocation are published; `alloc_block`'s own reservation for the
+    // block being collected never happened.
+    assert_eq!(arena.len(), 2);
+    assert!(arena.is_valid(baseline));
+    assert!(arena.is_valid(reentrant_idx));
+    assert_eq!(*arena.get(reentrant_idx), 999);
+
+    // The interrupted `alloc_block` panicked while still collecting its
+    // input into a `Vec`, before calling `reserve_range` at all, so it did
+    // not leak a reservation that a later allocation would have to wait
+    // behind or skip over. Confirm a follow-up `alloc` lands right after the
+    // reentrant allocation and is fully usable.
+    let after = arena.alloc(7);
+    assert_eq!(arena.len(), 3);
+    assert!(arena.is_valid(after));
+    assert_eq!(*arena.get(after), 7);
+}
+
 #[test]
 fn checkpoint_rollback_preserves_the_prefix_and_drops_the_suffix() {
     let drops = Rc::new(Cell::new(0));
@@ -126,6 +189,80 @@ fn foreign_and_diverged_checkpoints_are_rejected() {
 }
 
 #[test]
+fn validate_checkpoint_accepts_a_valid_checkpoint_without_mutating_the_arena() {
+    let arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let checkpoint = arena.checkpoint();
+    arena.alloc(3);
+
+    assert_eq!(arena.validate_checkpoint(checkpoint), Ok(()));
+    assert_eq!(arena.len(), 3, "validation must not mutate the arena");
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_foreign_checkpoint() {
+    let foreign_arena: SharedArena<i32> = SharedArena::new();
+    let foreign = foreign_arena.checkpoint();
+    let arena: SharedArena<i32> = SharedArena::new();
+
+    assert_eq!(
+        arena.validate_checkpoint(foreign),
+        Err(CheckpointError::ForeignArena)
+    );
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_checkpoint_beyond_current_length() {
+    let mut arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let cp_early = arena.checkpoint(); // saves len=2
+    arena.alloc(3);
+    arena.alloc(4);
+    arena.alloc(5);
+    let cp_late = arena.checkpoint(); // saves len=5
+    arena.rollback(cp_early); // back to len=2
+
+    assert_eq!(
+        arena.validate_checkpoint(cp_late),
+        Err(CheckpointError::BeyondCurrent {
+            checkpoint_len: 5,
+            current_len: 2,
+        })
+    );
+}
+
+#[test]
+fn validate_checkpoint_rejects_a_diverged_prefix() {
+    let mut arena = SharedArena::new();
+    let _root = arena.alloc(0);
+    let branch = arena.checkpoint();
+    let _stale = arena.alloc(1);
+    let stale_prefix = arena.checkpoint();
+    arena.rollback(branch);
+    let _current = arena.alloc(2);
+
+    assert_eq!(
+        arena.validate_checkpoint(stale_prefix),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+}
+
+#[test]
+fn validate_checkpoint_accepts_an_empty_arena_checkpoint_after_reset() {
+    let mut arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    arena.reset();
+    let empty_checkpoint = arena.checkpoint();
+
+    assert_eq!(empty_checkpoint.len(), 0);
+    assert!(empty_checkpoint.tail().is_none());
+    assert_eq!(arena.validate_checkpoint(empty_checkpoint), Ok(()));
+}
+
+#[test]
 fn reset_preserves_drop_exactly_once() {
     let drops = Rc::new(Cell::new(0));
     let mut arena = SharedArena::new();
@@ -154,6 +291,23 @@ fn iterators_and_drain_preserve_allocation_order() {
     );
     assert_eq!(arena.drain().collect::<Vec<_>>(), vec![10, 20, 30]);
     assert!(arena.is_empty());
+}
+
+#[test]
+fn drain_empties_the_arena_and_is_reusable_afterward() {
+    let mut arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    arena.alloc(3);
+
+    assert_eq!(arena.drain().collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(arena.len(), 0);
+    assert_eq!(arena.drain().collect::<Vec<_>>(), Vec::<i32>::new());
+
+    let after = arena.alloc(4);
+    assert_eq!(arena.len(), 1);
+    assert!(arena.is_valid(after));
+    assert_eq!(*arena.get(after), 4);
 }
 
 #[test]
@@ -327,23 +481,317 @@ fn high_contention_completes_without_observed_livelock() {
 
     let arena = Arc::new(SharedArena::new());
     let barrier = Arc::new(Barrier::new(THREADS));
+    let (done_tx, done_rx) = mpsc::channel();
     let start = Instant::now();
     let handles: Vec<_> = (0..THREADS)
         .map(|thread_id| {
             let arena = Arc::clone(&arena);
             let barrier = Arc::clone(&barrier);
+            let done_tx = done_tx.clone();
             thread::spawn(move || {
                 barrier.wait();
                 for offset in 0..PER_THREAD {
                     arena.alloc(thread_id * PER_THREAD + offset);
                 }
+                // Signal completion instead of joining directly: the
+                // receiver below enforces a shared time budget, so a real
+                // hang fails this test with a timeout instead of blocking
+                // forever in `join`. Ignore a failed send: it only happens
+                // when the main thread already hit the shared deadline,
+                // failed its assert, and dropped `done_rx` while unwinding —
+                // a slow-but-live worker landing here afterward should not
+                // itself panic on the way out and clutter that failure's
+                // output.
+                let _ = done_tx.send(());
             })
         })
         .collect();
+    drop(done_tx);
+
+    // Wait for all THREADS completion signals against one shared deadline,
+    // recomputing the remaining budget from wall-clock time on every
+    // iteration so the total wait cannot exceed LIMIT regardless of how many
+    // signals are still pending (no race on a remainder counter).
+    let deadline = start + LIMIT;
+    for signaled in 0..THREADS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            done_rx.recv_timeout(remaining).is_ok(),
+            "high-contention workers did not finish within {LIMIT:?} or a \
+             worker panicked: {signaled} of {THREADS} signaled"
+        );
+    }
+    let signaled_elapsed = start.elapsed();
+
+    // Every worker has signaled completion, so joining cannot block.
     for handle in handles {
         handle.join().unwrap();
     }
 
     assert_eq!(arena.len(), THREADS * PER_THREAD);
-    assert!(start.elapsed() < LIMIT);
+    assert!(
+        signaled_elapsed < LIMIT,
+        "all workers signaled, but only at the deadline boundary: \
+         {signaled_elapsed:?} >= {LIMIT:?}"
+    );
+}
+
+#[test]
+fn rollback_with_a_panicking_drop_keeps_counters_and_is_retryable() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic_on_drop, "intentional panic in Drop");
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = SharedArena::new();
+    let kept = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    let checkpoint = arena.checkpoint();
+    let panicking = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: true,
+    });
+    let last = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.rollback(checkpoint)));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 2);
+    assert_eq!(arena.len(), 1);
+    assert!(arena.is_valid(kept));
+    assert!(!arena.is_valid(panicking));
+    assert!(!arena.is_valid(last));
+    assert_eq!(
+        arena.iter().count(),
+        1,
+        "iter must not observe an empty published slot"
+    );
+
+    assert_eq!(
+        arena.try_rollback(checkpoint),
+        Ok(()),
+        "retry after the partial rollback"
+    );
+    assert_eq!(arena.len(), 1);
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    assert_eq!(
+        replacement.slot(),
+        1,
+        "no reservation leaked from the interrupted rollback"
+    );
+    assert!(arena.is_valid(replacement));
+    assert!(!arena.is_valid(panicking));
+
+    drop(arena);
+    assert_eq!(
+        drops.get(),
+        4,
+        "kept and replacement are dropped exactly once when the arena drops"
+    );
+}
+
+#[test]
+fn reset_with_a_panicking_drop_keeps_counters_and_is_retryable() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic_on_drop, "intentional panic in Drop");
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = SharedArena::new();
+    let kept = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    let panicking = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: true,
+    });
+    arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.reset()));
+    assert!(result.is_err());
+    assert_eq!(drops.get(), 2);
+    assert_eq!(arena.len(), 1);
+    assert!(arena.is_valid(kept));
+    assert!(!arena.is_valid(panicking));
+
+    arena.reset();
+    assert_eq!(drops.get(), 3);
+    assert!(arena.is_empty());
+
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    assert_eq!(replacement.slot(), 0);
+    assert!(arena.is_valid(replacement));
+    assert!(!arena.is_valid(kept));
+}
+
+// `drain` collects every value into a local `Vec` and already reports
+// `len() == 0` by the time it returns normally: unlike `rollback`/`reset`,
+// there is no partial-drain state for a value's destructor to interrupt
+// here. A destructor that panics on drop only fires later, when the caller
+// drops the returned (but never consumed) iterator. This checks that every
+// value still drops exactly once when that happens, and that the arena —
+// already empty before the panic — stays usable afterward.
+#[test]
+fn drain_drops_every_value_exactly_once_when_the_returned_iterator_panics_on_drop() {
+    struct Tracked {
+        drops: Rc<Cell<u32>>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            assert!(!self.panic_on_drop, "intentional panic in Drop");
+        }
+    }
+
+    let drops = Rc::new(Cell::new(0));
+    let mut arena = SharedArena::new();
+    arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: true,
+    });
+    arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _drained = arena.drain();
+    }));
+    assert!(result.is_err());
+    assert_eq!(arena.len(), 0);
+    assert_eq!(drops.get(), 2, "both values drop exactly once");
+
+    let replacement = arena.alloc(Tracked {
+        drops: Rc::clone(&drops),
+        panic_on_drop: false,
+    });
+    assert_eq!(
+        replacement.slot(),
+        0,
+        "the arena is reusable after the panic"
+    );
+    assert!(arena.is_valid(replacement));
+}
+
+#[test]
+fn checkpoint_taken_before_drain_is_rejected_then_reported_as_diverged() {
+    let mut arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    let checkpoint = arena.checkpoint();
+    let _ = arena.drain().count();
+
+    assert_eq!(
+        arena.try_rollback(checkpoint),
+        Err(CheckpointError::BeyondCurrent {
+            checkpoint_len: 2,
+            current_len: 0,
+        })
+    );
+
+    arena.alloc(3);
+    arena.alloc(4);
+    assert_eq!(
+        arena.try_rollback(checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+    assert_eq!(arena.len(), 2);
+}
+
+#[test]
+fn checkpoint_from_the_other_arena_type_is_rejected_as_foreign_in_both_directions() {
+    let single: Arena<i32> = Arena::new();
+    let single_checkpoint = single.checkpoint();
+    let mut shared = SharedArena::new();
+    shared.alloc(1);
+    assert_eq!(
+        shared.try_rollback(single_checkpoint),
+        Err(CheckpointError::ForeignArena)
+    );
+    assert_eq!(shared.len(), 1);
+
+    let shared_checkpoint = shared.checkpoint();
+    let mut other_single = Arena::new();
+    other_single.alloc(1);
+    assert_eq!(
+        other_single.try_rollback(shared_checkpoint),
+        Err(CheckpointError::ForeignArena)
+    );
+    assert_eq!(other_single.len(), 1);
+}
+
+#[test]
+fn rollback_then_alloc_block_reuses_slots_without_tripping_the_occupied_assertion() {
+    let mut arena = SharedArena::new();
+    let root = arena.alloc(0);
+    let checkpoint = arena.checkpoint();
+    let old_block = arena.alloc_block([1, 2, 3]);
+    arena.rollback(checkpoint);
+    let new_block = arena.alloc_block([4, 5, 6]);
+
+    assert_eq!(new_block.first().map(Idx::slot), Some(1));
+    assert!(arena.is_valid(root));
+    assert!(old_block.indices().all(|idx| !arena.is_valid(idx)));
+    assert!(new_block.indices().all(|idx| arena.is_valid(idx)));
+    assert_eq!(arena.len(), 4);
+    assert!(!old_block.contains(new_block.get(0).unwrap()));
+}
+
+#[test]
+fn shared_arena_creation_inside_a_tls_destructor_at_thread_exit_works() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static OK: AtomicBool = AtomicBool::new(false);
+
+    struct OnExit;
+
+    impl Drop for OnExit {
+        fn drop(&mut self) {
+            let arena = SharedArena::new();
+            let idx = arena.alloc(1);
+            if arena.is_valid(idx) {
+                OK.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    thread_local! {
+        static ON_EXIT: OnExit = const { OnExit };
+    }
+    std::thread::spawn(|| ON_EXIT.with(|_| {})).join().unwrap();
+
+    assert!(OK.load(Ordering::SeqCst));
 }

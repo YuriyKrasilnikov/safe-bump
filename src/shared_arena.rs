@@ -62,9 +62,19 @@ impl<T> SharedArena<T> {
     ///
     /// # Panics
     ///
-    /// The input iterator may panic while it is collected. The arena is still
-    /// unchanged at that point. The method also panics on stamp/slot exhaustion
-    /// or violation of an internal reserved-slot invariant.
+    /// The input iterator may panic while it is collected, before this call
+    /// reserves or publishes anything: this method's own reservation and
+    /// publication effects do not happen in that case. This is not a
+    /// guarantee that the arena as a whole is unchanged. `SharedArena` takes
+    /// `&self`, so the supplied iterator can itself hold another reference to
+    /// this same arena (from this thread or another) and allocate through it
+    /// — including via reentrant calls made from its own `Iterator::next` —
+    /// before panicking; any such reentrant allocation is the iterator's own
+    /// effect, is not rolled back, and stays published. Compare
+    /// [`Arena::alloc_block`](crate::Arena::alloc_block), which takes
+    /// `&mut self` and therefore statically excludes a reentrant caller-side
+    /// mutation. The method also panics on stamp/slot exhaustion or
+    /// violation of an internal reserved-slot invariant.
     pub fn alloc_block(&self, iter: impl IntoIterator<Item = T>) -> Block<T> {
         let values: Vec<T> = iter.into_iter().collect();
         let len = values.len();
@@ -219,22 +229,34 @@ impl<T> SharedArena<T> {
 
     /// Removes and yields all values in allocation order.
     ///
+    /// Slots are unpublished from the last one down to the first: each
+    /// slot's `published` and `reserved` counters are decremented before
+    /// that slot is taken. A panic partway through therefore leaves the
+    /// slots of the prefix `[0, slot)` untouched, with both counters
+    /// describing exactly that prefix, so `len()` reports it accurately and
+    /// a later `drain` or `alloc` continues from a consistent state, rather
+    /// than reporting an empty arena over storage that was only partially
+    /// taken. The values collected before any panic are lost with the local
+    /// buffer; the returned iterator, when this call completes normally,
+    /// still yields every value in allocation order.
+    ///
     /// # Panics
     ///
     /// Panics only if the internal invariant that every published slot is
     /// occupied has been violated.
     pub fn drain(&mut self) -> std::vec::IntoIter<T> {
         let current = *self.published.get_mut();
-        *self.published.get_mut() = 0;
-        *self.reserved.get_mut() = 0;
         let mut values = Vec::with_capacity(current);
-        for slot in 0..current {
+        for slot in (0..current).rev() {
+            *self.published.get_mut() = slot;
+            *self.reserved.get_mut() = slot;
             let stamped = self
                 .storage
                 .take(slot)
                 .expect("every published slot contains a value");
             values.push(stamped.value);
         }
+        values.reverse();
         values.into_iter()
     }
 
@@ -266,7 +288,41 @@ impl<T> SharedArena<T> {
         }
     }
 
-    fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
+    /// Validates `checkpoint` against this arena's current state without
+    /// changing the arena.
+    ///
+    /// Checks that `checkpoint` was created by this arena
+    /// ([`CheckpointError::ForeignArena`] otherwise), that its length does
+    /// not exceed the current published length
+    /// ([`CheckpointError::BeyondCurrent`] otherwise), and that the stamp of
+    /// the slot at `checkpoint.len() - 1` still matches the stamp saved in
+    /// the checkpoint ([`CheckpointError::DivergedPrefix`] otherwise).
+    /// `Ok(())` means that [`rollback`](Self::rollback) or
+    /// [`try_rollback`](Self::try_rollback) with this checkpoint cannot fail
+    /// *validation* right now: a panicking destructor in the discarded
+    /// suffix is still possible and is documented under the `# Panics`
+    /// sections of those methods.
+    ///
+    /// A caller holding several arenas can validate every checkpoint it
+    /// intends to roll back before mutating any of them, turning an
+    /// otherwise independent multi-arena rollback into an all-or-nothing
+    /// operation: once every checkpoint validates, none of the subsequent
+    /// `rollback` calls can fail with a [`CheckpointError`]. This holds even
+    /// across concurrent allocation from other threads: `alloc` and
+    /// `alloc_block` only append new slots through `&self` and never touch
+    /// the stamp already stored at the checkpoint's boundary slot, so they
+    /// cannot turn a validated checkpoint into a diverged one. Only an
+    /// exclusive `&mut self` mutation on the same arena — a `rollback`,
+    /// `reset`, or `drain` that truncates past the checkpoint (`drain`
+    /// always truncates to zero) and lets a later allocation reuse that
+    /// slot with a fresh stamp — can invalidate a validation result taken
+    /// earlier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError`] for a foreign checkpoint, a checkpoint
+    /// beyond the current length, or a historical prefix that was replaced.
+    pub fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
         if checkpoint.owner() != self.owner {
             return Err(CheckpointError::ForeignArena);
         }

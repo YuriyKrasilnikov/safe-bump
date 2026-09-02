@@ -55,8 +55,9 @@ assert_eq!(arena[block.get(1).unwrap()], 20);
 assert!(block.get(3).is_none());
 ```
 
-The iterator is collected before arena state changes. If it panics, the arena
-retains its original prefix.
+The iterator is collected before `Arena` state changes. If it panics, the
+arena as a whole retains its original prefix — `alloc_block` borrows `Arena`
+exclusively, so no other code can have mutated it in the meantime.
 
 ## Historical checkpoints
 
@@ -118,6 +119,10 @@ cannot interleave their slots. Reads of already-published handles are
 wait-free and return `&T` without a guard. Allocation cooperatively advances a
 contiguous publication prefix and may busy-wait for an earlier reserving
 thread; allocation is **not** claimed to be wait-free or starvation-free.
+`alloc_block` takes `&self`, so its collected-before-committing guarantee on
+input panic covers only its own reservation and publication: a reentrant
+iterator holding another reference to the same arena can allocate and
+publish through it before panicking, and that allocation stays published.
 
 This feature remains experimental because allocation can wait and its API may
 change before the feature is stabilized. The default crate exposes only
