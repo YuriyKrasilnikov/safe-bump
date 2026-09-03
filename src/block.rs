@@ -6,7 +6,7 @@ use crate::stamp::Stamp;
 /// Capability for one contiguous batch allocation.
 ///
 /// Every non-empty block owns a half-open slot interval `[start, start + len)`
-/// under one fresh allocation stamp. [`get`](Self::get) is the only public
+/// under one generation-segment stamp. [`get`](Self::get) is the only public
 /// operation that derives an offset index, so an index cannot escape the
 /// interval it proves.
 pub struct Block<T> {

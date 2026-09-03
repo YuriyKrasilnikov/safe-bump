@@ -38,6 +38,16 @@ impl Stamp {
     const fn from_raw(raw: u64) -> Self {
         Self(NonZeroU64::new(raw).expect("the stamp sequence starts at one"))
     }
+
+    /// Reconstructs a stamp from a raw non-zero value previously produced by
+    /// [`get`](Self::get). Used by `Arena`'s and `SharedArena`'s inline
+    /// mirrors of the current segment stamp, which cache it as a plain
+    /// `AtomicU64` (`0` meaning "not yet assigned") so the common allocation
+    /// and validation paths can read it with a single `Relaxed` load instead
+    /// of chasing a pointer into the identity sidecar.
+    pub(crate) const fn from_nonzero(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
 }
 
 struct StampPool {

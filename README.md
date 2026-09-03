@@ -17,11 +17,13 @@ can exist in another arena, and rollback/reset can reuse it for a different
 value. `Idx<T>` therefore carries:
 
 - the absolute slot used for O(1) access;
-- a process-unique stamp created by the allocation operation.
+- the process-unique stamp of the *generation segment* active when the slot
+  was written — every allocation since the arena's last rollback, reset, or
+  drain shares one such stamp.
 
 There is no public constructor from a number. `Idx::slot()` is diagnostic only
-and cannot be converted back into a handle. Access succeeds exactly when both
-the slot and stamp match the live arena metadata.
+and cannot be converted back into a handle. Access succeeds exactly when the
+slot is live and its segment's stamp still matches the one the index carries.
 
 ```rust
 use safe_bump::Arena;
@@ -61,8 +63,9 @@ exclusively, so no other code can have mutated it in the meantime.
 
 ## Historical checkpoints
 
-A checkpoint contains the arena identity, prefix length, and tail allocation
-stamp. `try_rollback` rejects:
+A checkpoint contains the arena's permanent birth identity, prefix length,
+and the stamp of the segment that owned the prefix's tail slot at capture
+time. `try_rollback` rejects:
 
 - a checkpoint created by another arena;
 - a checkpoint beyond the current length;
@@ -81,21 +84,33 @@ assert_eq!(arena[root], "root");
 assert!(!arena.is_valid(stale));
 ```
 
-Rollback and reset remove each value and its stamp before running the value's
-destructor. If user `Drop` code panics, the two backing vectors remain aligned,
-and cleanup can be retried.
+Rollback and reset commit a fresh generation segment for the discarded range
+*before* dropping any value in it, so every index into that range is already
+rejected from the moment the call begins — regardless of how far the drop
+loop has physically gotten when a destructor panics. If user `Drop` code
+panics, the arena stays structurally consistent and the same rollback or
+reset can be retried to finish dropping the rest of the range.
 
 ## Layout and cost
 
-`Arena<T>` stores values in a contiguous `Vec<T>` and stamps in a parallel
-metadata vector. Sequential traversal therefore has the same value layout as
-an ordinary vector; capability validation adds one metadata lookup. Current
-metadata cost is eight bytes per live slot plus vector capacity overhead.
-Each participating thread reserves globally disjoint stamp ranges and
-dispenses them locally, so ordinary allocation does not perform a
-process-global atomic transition for every value. Ranges are shared by every
-arena used on that thread, and reserved values are never recycled, preserving
-process-wide uniqueness after arenas or threads are dropped.
+`Arena<T>` stores values in a contiguous `Vec<T>`, with no parallel per-slot
+metadata vector. Capability validation reads one small, lazily assigned
+identity instead: a permanent birth stamp, the stamp of the current
+allocation segment, and a table of archived segments for slots an earlier
+rollback, reset, or drain left behind. Validating a handle compares its
+stamp against an inline mirror of the current segment stamp — one field
+read, no matter how many values the arena holds — and only falls back to a
+binary search over the archive table for a stamp that does not match; that
+table stays empty until an arena has been invalidated more than once. The
+identity itself lives behind a lazily assigned sidecar handle that costs a
+fixed handful of bytes on `Arena<T>` whether or not it has ever been
+assigned, and is only actually allocated on the first capability the arena
+issues, not on construction. Each
+participating thread reserves globally disjoint stamp ranges and dispenses
+them locally, so ordinary allocation does not perform a process-global atomic
+transition for every value. Ranges are shared by every arena used on that
+thread, and reserved values are never recycled, preserving process-wide
+uniqueness after arenas or threads are dropped.
 
 | Operation | Complexity |
 |---|---|
@@ -169,10 +184,27 @@ cargo bench --locked --manifest-path benchmarks/release-comparison/Cargo.toml
 
 The release comparison covers allocation, validated lookup, sequential
 iteration, speculative rollback, and concurrent allocation. It deliberately
-does not pretend that v0.2 has equivalents for v0.3 block capabilities. A
-slower v0.3 validated lookup is also not silently classified as a product
-regression: the report keeps it next to the stronger arena-identity and
-allocation-history checks that v0.2 did not perform.
+does not pretend that v0.2 has equivalents for v0.3 block capabilities. In
+the paired alternating-order raw protocol, allocation, iteration, and shared allocation are at parity with v0.2.1, and
+so is rollback on an arena that has already archived a segment. The first capability an
+arena issues (its first `alloc`, `alloc_block` or `checkpoint`) allocates
+the arena's identity once, and its first rollback allocates the archive table
+once; both are visible only on arenas that allocate a few dozen values and are
+then discarded. Validated lookup pays the cost of
+one stamp comparison against an inline mirror of the current segment
+stamp. The identity itself (birth stamp, current stamp, current-start,
+archive table) is not allocated at all until an arena's first capability —
+but the lazily-assigned sidecar handle plus the inline mirror still cost a
+fixed handful of bytes on every arena, allocated or not, so an empty arena
+is larger than in 0.2.1 — `size_of::<Arena<u64>>()` is 48 bytes versus
+0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1584 bytes versus 0.2.1's
+784 — and creating many empty arenas is measurably slower than 0.2.1, with
+the gap widening with the number of arenas created rather than staying
+within a fixed ratio. A slower validated lookup or arena creation is not
+silently classified as a product regression: the report keeps each next to the
+stronger arena-identity and allocation-history checks that v0.2 did not
+perform. These are diagnostic comparisons on one host, not portable latency
+guarantees.
 
 Executable cross-version quality witnesses demonstrate the corresponding
 foreign-index, stale-ABA, and foreign-checkpoint failures in v0.2.1 and their

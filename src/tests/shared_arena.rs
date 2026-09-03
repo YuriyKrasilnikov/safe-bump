@@ -310,6 +310,72 @@ fn drain_empties_the_arena_and_is_reusable_afterward() {
     assert_eq!(*arena.get(after), 4);
 }
 
+/// `drain` commits a fresh segment stamp before it takes any slot (see
+/// `Self::drain`'s doc comment), so slots regrown to the exact pre-drain
+/// length belong to a new generation, not the old one: every pre-drain
+/// `Idx` is rejected, a pre-drain `Checkpoint` whose length no longer
+/// exceeds the regrown length is rejected as `DivergedPrefix` rather than
+/// wrongly validating, and only the freshly minted indices are valid.
+#[test]
+fn drain_then_regrowth_to_the_same_length_rejects_every_pre_drain_capability() {
+    let mut arena = SharedArena::new();
+    let old = [arena.alloc(1), arena.alloc(2), arena.alloc(3)];
+    let old_checkpoint = arena.checkpoint();
+
+    let drained: Vec<_> = arena.drain().collect();
+    assert_eq!(drained, vec![1, 2, 3]);
+
+    let new = [arena.alloc(10), arena.alloc(20), arena.alloc(30)];
+
+    assert_eq!(arena.len(), 3);
+    for idx in old {
+        assert!(!arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), None);
+    }
+    assert_eq!(
+        arena.validate_checkpoint(old_checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 3 })
+    );
+    for (idx, expected) in new.into_iter().zip([10, 20, 30]) {
+        assert!(arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), Some(&expected));
+    }
+}
+
+/// The same as
+/// `drain_then_regrowth_to_the_same_length_rejects_every_pre_drain_capability`,
+/// but the iterator `drain` returns is dropped without being consumed.
+/// Every slot is already taken (and the fresh generation already committed)
+/// by the time `drain` returns the iterator, regardless of whether the
+/// caller ever reads it — unlike `Arena::drain`, whose `vec::Drain` only
+/// removes values lazily as the caller consumes or drops it, `SharedArena`'s
+/// `drain` unpublishes and takes every slot eagerly inside the call itself.
+#[test]
+fn drain_dropped_without_consuming_still_regrows_under_a_new_generation() {
+    let mut arena = SharedArena::new();
+    let old = [arena.alloc(1), arena.alloc(2), arena.alloc(3)];
+    let old_checkpoint = arena.checkpoint();
+
+    drop(arena.drain());
+    assert_eq!(arena.len(), 0);
+
+    let new = [arena.alloc(10), arena.alloc(20), arena.alloc(30)];
+
+    assert_eq!(arena.len(), 3);
+    for idx in old {
+        assert!(!arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), None);
+    }
+    assert_eq!(
+        arena.validate_checkpoint(old_checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 3 })
+    );
+    for (idx, expected) in new.into_iter().zip([10, 20, 30]) {
+        assert!(arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), Some(&expected));
+    }
+}
+
 #[test]
 fn extend_from_iter_and_default_share_the_block_semantics() {
     let mut extended = SharedArena::default();
@@ -380,7 +446,7 @@ fn concurrent_blocks_never_interleave() {
         let indices: Vec<_> = block.indices().collect();
         assert_eq!(indices.len(), BLOCK_LEN);
         assert!(indices.windows(2).all(|pair| {
-            pair[0].same_allocation(pair[1]) && pair[0].slot() + 1 == pair[1].slot()
+            pair[0].stamp() == pair[1].stamp() && pair[0].slot() + 1 == pair[1].slot()
         }));
         for (offset, idx) in indices.into_iter().enumerate() {
             assert_eq!(*arena.get(idx), thread_id * 1000 + offset);
@@ -639,7 +705,11 @@ fn reset_with_a_panicking_drop_keeps_counters_and_is_retryable() {
     assert!(result.is_err());
     assert_eq!(drops.get(), 2);
     assert_eq!(arena.len(), 1);
-    assert!(arena.is_valid(kept));
+    // `reset` always targets length 0, so its segment boundary commits
+    // before the drop loop covers *every* existing slot, including `kept`
+    // (not yet taken when `panicking`'s destructor fired). See
+    // `crate::segments`'s module documentation.
+    assert!(!arena.is_valid(kept));
     assert!(!arena.is_valid(panicking));
 
     arena.reset();

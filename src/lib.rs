@@ -7,17 +7,23 @@
 //!
 //! # Arena type
 //!
-//! [`Arena<T>`] stores values contiguously in a [`Vec<T>`]. Allocation stamps
-//! live in a parallel metadata vector, so sequential value traversal retains
-//! the locality of an ordinary vector. Checkpoints are bound to one arena and
-//! one historical allocation prefix.
+//! [`Arena<T>`] stores values contiguously in a [`Vec<T>`], with no parallel
+//! per-slot metadata vector: capability validation is backed by one small,
+//! lazily assigned arena identity instead — a permanent birth stamp, the
+//! stamp of the current allocation segment, and a small table of archived
+//! segments for slots an earlier `rollback`/`reset`/`drain` left behind (see
+//! `crate::segments`). Sequential value traversal therefore has the same
+//! locality as an ordinary vector, and validating a handle is one field
+//! comparison in the common case. Checkpoints are bound to one arena and one
+//! historical allocation prefix.
 //!
 //! # Key properties
 //!
 //! - **Zero `unsafe`**: enforced by `#![forbid(unsafe_code)]`
 //! - **Auto [`Drop`]**: destructors run on reset, rollback, and arena drop
 //! - **Unforgeable handles**: no public raw-index constructor
-//! - **ABA resistance**: reused slots receive fresh allocation stamps
+//! - **ABA resistance**: a slot reused after `rollback`/`reset`/`drain`
+//!   belongs to a new generation, so a stale index against it is rejected
 //! - **Validated rollback**: foreign and diverged checkpoints are rejected
 //! - **Explicit blocks**: batch contiguity is carried by [`Block<T>`]
 //!
@@ -54,6 +60,7 @@ mod checkpoint;
 mod chunked_storage;
 mod idx;
 mod iter;
+mod segments;
 #[cfg(feature = "experimental-shared")]
 mod shared_arena;
 mod stamp;

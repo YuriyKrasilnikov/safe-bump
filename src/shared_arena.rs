@@ -1,13 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::chunked_storage::ChunkedStorage;
-use crate::stamp::Stamp;
+use crate::segments::SharedIdentity;
 use crate::{Block, Checkpoint, CheckpointError, Idx};
-
-struct Stamped<T> {
-    stamp: Stamp,
-    value: T,
-}
 
 /// Experimental concurrent typed arena.
 ///
@@ -16,21 +11,29 @@ struct Stamped<T> {
 /// contiguous publication prefix. It can wait for an earlier reserving thread;
 /// therefore allocation is deliberately **not** described as wait-free.
 ///
+/// Storage slots hold plain `T` values, with no per-slot stamp wrapper:
+/// capability validation is backed by one lazily assigned identity (birth
+/// stamp, current segment stamp, and a small archived-segment table), the
+/// same mechanism [`Arena`](crate::Arena) uses — see `crate::segments` for
+/// the full mechanism.
+///
 /// This type is available only with the `experimental-shared` feature. Its API
 /// may change before the feature is stabilized.
 pub struct SharedArena<T> {
-    owner: Stamp,
-    storage: ChunkedStorage<Stamped<T>>,
+    identity: SharedIdentity,
+    storage: ChunkedStorage<T>,
     reserved: AtomicUsize,
     published: AtomicUsize,
 }
 
 impl<T> SharedArena<T> {
-    /// Creates an empty concurrent arena with a fresh identity.
+    /// Creates an empty concurrent arena. The identity is not assigned yet;
+    /// it is created lazily by the first operation that hands out an `Idx`,
+    /// `Block`, or `Checkpoint`.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            owner: Stamp::fresh(),
+            identity: SharedIdentity::new(),
             storage: ChunkedStorage::new(),
             reserved: AtomicUsize::new(0),
             published: AtomicUsize::new(0),
@@ -46,9 +49,9 @@ impl<T> SharedArena<T> {
     /// Panics if the process exhausts the stamp or slot space, or if an
     /// internal storage invariant reports an already-occupied reserved slot.
     pub fn alloc(&self, value: T) -> Idx<T> {
-        let stamp = Stamp::fresh();
+        let stamp = self.identity.current();
         let slot = self.reserve_range(1);
-        let inserted = self.storage.set(slot, Stamped { stamp, value });
+        let inserted = self.storage.set(slot, value);
         assert!(inserted, "reserved slot {slot} was already occupied");
         self.advance_published(slot);
         Idx::new(stamp, slot)
@@ -82,13 +85,13 @@ impl<T> SharedArena<T> {
             return Block::empty();
         }
 
-        let stamp = Stamp::fresh();
+        let stamp = self.identity.current();
         let start = self.reserve_range(len);
         for (offset, value) in values.into_iter().enumerate() {
             let slot = start
                 .checked_add(offset)
                 .expect("a reserved allocation range has a representable end");
-            let inserted = self.storage.set(slot, Stamped { stamp, value });
+            let inserted = self.storage.set(slot, value);
             assert!(inserted, "reserved slot {slot} was already occupied");
         }
         let last = start
@@ -103,11 +106,11 @@ impl<T> SharedArena<T> {
     /// # Panics
     ///
     /// Panics for an unpublished, foreign, or stale capability.
+    #[inline]
     #[must_use]
     pub fn get(&self, idx: Idx<T>) -> &T {
-        self.try_get(idx).unwrap_or_else(|| {
-            panic!("index capability is foreign, stale, or unpublished: {idx:?}")
-        })
+        self.try_get(idx)
+            .unwrap_or_else(|| unpublished_index_panic(idx))
     }
 
     /// Returns the length of the contiguous published prefix.
@@ -126,8 +129,8 @@ impl<T> SharedArena<T> {
     #[must_use]
     pub fn checkpoint(&self) -> Checkpoint<T> {
         let len = self.len();
-        let tail = len.checked_sub(1).map(|slot| self.storage.get(slot).stamp);
-        Checkpoint::new(self.owner, len, tail)
+        let tail = len.checked_sub(1).map(|slot| self.identity.stamp_of(slot));
+        Checkpoint::new(self.identity.birth(), len, tail)
     }
 
     /// Validates and rolls back to a historical prefix.
@@ -142,19 +145,27 @@ impl<T> SharedArena<T> {
     ///
     /// # Panics
     ///
-    /// A discarded value's destructor may panic. Publication counters and the
-    /// slot are updated before the destructor runs.
+    /// A discarded value's destructor may panic. The new segment boundary is
+    /// committed *before* any value is taken and dropped, so every slot
+    /// `>= checkpoint.len()` is already rejected by
+    /// [`is_valid`](Self::is_valid) from the moment this call begins —
+    /// closing an ABA hole a commit-after-the-loop ordering would have (see
+    /// [`Arena::try_rollback`](crate::Arena::try_rollback)'s docs for the
+    /// full argument, which applies identically here). The same checkpoint
+    /// can still be retried to finish unpublishing the rest of the suffix.
     pub fn try_rollback(&mut self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
         self.validate_checkpoint(checkpoint)?;
-        while *self.published.get_mut() > checkpoint.len() {
+        let target_len = checkpoint.len();
+        self.identity.commit(target_len);
+        while *self.published.get_mut() > target_len {
             let slot = *self.published.get_mut() - 1;
             *self.published.get_mut() = slot;
             *self.reserved.get_mut() = slot;
-            let stamped = self
+            let value = self
                 .storage
                 .take(slot)
                 .expect("every published slot contains a value");
-            drop(stamped);
+            drop(value);
         }
         Ok(())
     }
@@ -174,37 +185,46 @@ impl<T> SharedArena<T> {
     ///
     /// # Panics
     ///
-    /// A value destructor may panic. Counters and the slot are updated before
-    /// the destructor runs, so a subsequent reset can continue cleanup.
+    /// A value destructor may panic. As with
+    /// [`try_rollback`](Self::try_rollback), the new (empty) generation is
+    /// committed before any value is taken and dropped, so a subsequent
+    /// reset can continue cleanup and no stale index can validate again in
+    /// the meantime.
     pub fn reset(&mut self) {
+        self.identity.commit(0);
         while *self.published.get_mut() > 0 {
             let slot = *self.published.get_mut() - 1;
             *self.published.get_mut() = slot;
             *self.reserved.get_mut() = slot;
-            let stamped = self
+            let value = self
                 .storage
                 .take(slot)
                 .expect("every published slot contains a value");
-            drop(stamped);
+            drop(value);
         }
     }
 
     /// Returns whether `idx` is currently published by this arena.
+    ///
+    /// Reordered validation: `idx.stamp()` matching the identity's current
+    /// stamp (one `Relaxed` load) already implies "covered by the current
+    /// segment" — see `crate::segments`'s "Reordered validation" section —
+    /// so the archive-table fallback only runs for a stamp that differs
+    /// from it.
+    #[inline]
     #[must_use]
     pub fn is_valid(&self, idx: Idx<T>) -> bool {
-        if idx.slot() >= self.len() {
-            return false;
-        }
-        self.storage.get(idx.slot()).stamp == idx.stamp()
+        idx.slot() < self.len() && self.identity.matches(idx.slot(), idx.stamp())
     }
 
     /// Returns the value, or `None` for a foreign, stale, or unpublished index.
+    #[inline]
     #[must_use]
     pub fn try_get(&self, idx: Idx<T>) -> Option<&T> {
         if !self.is_valid(idx) {
             return None;
         }
-        Some(&self.storage.get(idx.slot()).value)
+        Some(self.storage.get(idx.slot()))
     }
 
     /// Iterates over the published prefix in allocation order.
@@ -221,6 +241,7 @@ impl<T> SharedArena<T> {
     #[must_use]
     pub fn iter_indexed(&self) -> SharedArenaIterIndexed<'_, T> {
         SharedArenaIterIndexed {
+            identity: &self.identity,
             storage: &self.storage,
             pos: 0,
             len: self.len(),
@@ -243,18 +264,31 @@ impl<T> SharedArena<T> {
     /// # Panics
     ///
     /// Panics only if the internal invariant that every published slot is
-    /// occupied has been violated.
+    /// occupied has been violated. As with
+    /// [`try_rollback`](Self::try_rollback)/[`reset`](Self::reset), the new
+    /// (empty) generation is committed *before* any slot is taken, so every
+    /// slot this call is about to unpublish is already rejected by
+    /// [`is_valid`](Self::is_valid) from the moment `drain` begins —
+    /// regardless of how far the take loop below has physically gotten when
+    /// that invariant panic fires, and regardless of whether the caller
+    /// consumes or drops the returned iterator without reading it. Without
+    /// this ordering, a later `alloc` after such a panic could refill a
+    /// not-yet-taken slot under the stamp a pre-drain `Idx` for it still
+    /// carries, and that stale index would validate again — the same ABA
+    /// hole [`Arena::try_rollback`](crate::Arena::try_rollback)'s doc
+    /// comment describes for the single-thread arena.
     pub fn drain(&mut self) -> std::vec::IntoIter<T> {
+        self.identity.commit(0);
         let current = *self.published.get_mut();
         let mut values = Vec::with_capacity(current);
         for slot in (0..current).rev() {
             *self.published.get_mut() = slot;
             *self.reserved.get_mut() = slot;
-            let stamped = self
+            let value = self
                 .storage
                 .take(slot)
                 .expect("every published slot contains a value");
-            values.push(stamped.value);
+            values.push(value);
         }
         values.reverse();
         values.into_iter()
@@ -295,9 +329,9 @@ impl<T> SharedArena<T> {
     /// ([`CheckpointError::ForeignArena`] otherwise), that its length does
     /// not exceed the current published length
     /// ([`CheckpointError::BeyondCurrent`] otherwise), and that the stamp of
-    /// the slot at `checkpoint.len() - 1` still matches the stamp saved in
-    /// the checkpoint ([`CheckpointError::DivergedPrefix`] otherwise).
-    /// `Ok(())` means that [`rollback`](Self::rollback) or
+    /// the segment owning the slot at `checkpoint.len() - 1` still matches
+    /// the stamp saved in the checkpoint ([`CheckpointError::DivergedPrefix`]
+    /// otherwise). `Ok(())` means that [`rollback`](Self::rollback) or
     /// [`try_rollback`](Self::try_rollback) with this checkpoint cannot fail
     /// *validation* right now: a panicking destructor in the discarded
     /// suffix is still possible and is documented under the `# Panics`
@@ -310,12 +344,12 @@ impl<T> SharedArena<T> {
     /// `rollback` calls can fail with a [`CheckpointError`]. This holds even
     /// across concurrent allocation from other threads: `alloc` and
     /// `alloc_block` only append new slots through `&self` and never touch
-    /// the stamp already stored at the checkpoint's boundary slot, so they
-    /// cannot turn a validated checkpoint into a diverged one. Only an
+    /// the generation segment covering the checkpoint's boundary slot, so
+    /// they cannot turn a validated checkpoint into a diverged one. Only an
     /// exclusive `&mut self` mutation on the same arena — a `rollback`,
     /// `reset`, or `drain` that truncates past the checkpoint (`drain`
     /// always truncates to zero) and lets a later allocation reuse that
-    /// slot with a fresh stamp — can invalidate a validation result taken
+    /// slot in a new generation — can invalidate a validation result taken
     /// earlier.
     ///
     /// # Errors
@@ -323,7 +357,7 @@ impl<T> SharedArena<T> {
     /// Returns [`CheckpointError`] for a foreign checkpoint, a checkpoint
     /// beyond the current length, or a historical prefix that was replaced.
     pub fn validate_checkpoint(&self, checkpoint: Checkpoint<T>) -> Result<(), CheckpointError> {
-        if checkpoint.owner() != self.owner {
+        if self.identity.birth_raw() != checkpoint.owner().get() {
             return Err(CheckpointError::ForeignArena);
         }
         let current_len = self.len();
@@ -336,7 +370,7 @@ impl<T> SharedArena<T> {
         let current_tail = checkpoint
             .len()
             .checked_sub(1)
-            .map(|slot| self.storage.get(slot).stamp);
+            .map(|slot| self.identity.stamp_of(slot));
         if current_tail != checkpoint.tail() {
             return Err(CheckpointError::DivergedPrefix {
                 checkpoint_len: checkpoint.len(),
@@ -344,6 +378,15 @@ impl<T> SharedArena<T> {
         }
         Ok(())
     }
+}
+
+/// Out-of-line panic path for [`SharedArena::get`], kept separate so the
+/// common (valid-index) branch stays small enough to inline at the call
+/// site.
+#[cold]
+#[inline(never)]
+fn unpublished_index_panic<T>(idx: Idx<T>) -> ! {
+    panic!("index capability is foreign, stale, or unpublished: {idx:?}")
 }
 
 impl<T> Default for SharedArena<T> {
@@ -394,7 +437,7 @@ impl<T> std::iter::FromIterator<T> for SharedArena<T> {
 
 /// Iterator over values in a [`SharedArena`] publication prefix.
 pub struct SharedArenaIter<'a, T> {
-    storage: &'a ChunkedStorage<Stamped<T>>,
+    storage: &'a ChunkedStorage<T>,
     pos: usize,
     len: usize,
 }
@@ -406,7 +449,7 @@ impl<'a, T> Iterator for SharedArenaIter<'a, T> {
         if self.pos == self.len {
             return None;
         }
-        let value = &self.storage.get(self.pos).value;
+        let value = self.storage.get(self.pos);
         self.pos += 1;
         Some(value)
     }
@@ -422,7 +465,8 @@ impl<T> std::iter::FusedIterator for SharedArenaIter<'_, T> {}
 
 /// Iterator over `(Idx<T>, &T)` pairs in a [`SharedArena`] prefix.
 pub struct SharedArenaIterIndexed<'a, T> {
-    storage: &'a ChunkedStorage<Stamped<T>>,
+    identity: &'a SharedIdentity,
+    storage: &'a ChunkedStorage<T>,
     pos: usize,
     len: usize,
 }
@@ -434,10 +478,10 @@ impl<'a, T> Iterator for SharedArenaIterIndexed<'a, T> {
         if self.pos == self.len {
             return None;
         }
-        let stamped = self.storage.get(self.pos);
-        let idx = Idx::new(stamped.stamp, self.pos);
+        let value = self.storage.get(self.pos);
+        let idx = Idx::new(self.identity.stamp_of(self.pos), self.pos);
         self.pos += 1;
-        Some((idx, &stamped.value))
+        Some((idx, value))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

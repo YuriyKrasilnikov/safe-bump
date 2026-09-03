@@ -6,9 +6,16 @@ use crate::stamp::Stamp;
 ///
 /// An index is produced by [`Arena::alloc`](crate::Arena::alloc), by
 /// [`Block::get`](crate::Block::get), or by an indexed arena iterator. It
-/// carries both an absolute slot and a fresh allocation stamp. Consequently,
-/// an index from another arena or from a rolled-back allocation cannot alias a
-/// new value that later reuses the same slot.
+/// carries the stamp of the generation segment active when the slot was
+/// written, and the slot itself (see `crate::segments` for what a segment
+/// is). Consequently, an index from another arena, or from an allocation
+/// that a later `rollback`/`reset`/`drain` discarded and a subsequent
+/// allocation overwrote, cannot alias the value that now occupies that slot.
+///
+/// The stamp alone does this job: `Idx` carries no separate arena-owner
+/// field, because each stamp is drawn from one process-wide sequence, not a
+/// per-arena one, so two independently created arenas can never coin the
+/// same stamp value — a foreign stamp simply never matches.
 ///
 /// `Idx<T>` is [`Copy`], but has no public constructor from an integer.
 ///
@@ -43,13 +50,6 @@ impl<T> Idx<T> {
     #[must_use]
     pub const fn slot(self) -> usize {
         self.slot
-    }
-
-    /// Returns `true` when both indices were created by the same allocation
-    /// operation.
-    #[must_use]
-    pub const fn same_allocation<U>(self, other: Idx<U>) -> bool {
-        self.stamp.get() == other.stamp.get()
     }
 }
 

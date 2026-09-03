@@ -1,20 +1,20 @@
 use crate::Idx;
-use crate::stamp::Stamp;
+use crate::segments::Identity;
 
 /// Iterator yielding `(Idx<T>, &T)` pairs in allocation order.
 pub struct IterIndexed<'a, T> {
-    stamps: std::slice::Iter<'a, Stamp>,
+    identity: Option<&'a Identity>,
     values: std::slice::Iter<'a, T>,
     slot: usize,
 }
 
 impl<'a, T> IterIndexed<'a, T> {
     pub(crate) const fn new(
-        stamps: std::slice::Iter<'a, Stamp>,
+        identity: Option<&'a Identity>,
         values: std::slice::Iter<'a, T>,
     ) -> Self {
         Self {
-            stamps,
+            identity,
             values,
             slot: 0,
         }
@@ -25,12 +25,11 @@ impl<'a, T> Iterator for IterIndexed<'a, T> {
     type Item = (Idx<T>, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stamp = *self.stamps.next()?;
-        let value = self
-            .values
-            .next()
-            .expect("arena value and stamp vectors have equal length");
-        let idx = Idx::new(stamp, self.slot);
+        let value = self.values.next()?;
+        let identity = self
+            .identity
+            .expect("the identity is assigned whenever the arena holds values");
+        let idx = Idx::new(identity.stamp_of(self.slot), self.slot);
         self.slot += 1;
         Some((idx, value))
     }
@@ -45,18 +44,18 @@ impl<T> std::iter::FusedIterator for IterIndexed<'_, T> {}
 
 /// Mutable iterator yielding `(Idx<T>, &mut T)` pairs in allocation order.
 pub struct IterIndexedMut<'a, T> {
-    stamps: std::slice::Iter<'a, Stamp>,
+    identity: Option<&'a Identity>,
     values: std::slice::IterMut<'a, T>,
     slot: usize,
 }
 
 impl<'a, T> IterIndexedMut<'a, T> {
     pub(crate) const fn new(
-        stamps: std::slice::Iter<'a, Stamp>,
+        identity: Option<&'a Identity>,
         values: std::slice::IterMut<'a, T>,
     ) -> Self {
         Self {
-            stamps,
+            identity,
             values,
             slot: 0,
         }
@@ -67,12 +66,11 @@ impl<'a, T> Iterator for IterIndexedMut<'a, T> {
     type Item = (Idx<T>, &'a mut T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let stamp = *self.stamps.next()?;
-        let value = self
-            .values
-            .next()
-            .expect("arena value and stamp vectors have equal length");
-        let idx = Idx::new(stamp, self.slot);
+        let value = self.values.next()?;
+        let identity = self
+            .identity
+            .expect("the identity is assigned whenever the arena holds values");
+        let idx = Idx::new(identity.stamp_of(self.slot), self.slot);
         self.slot += 1;
         Some((idx, value))
     }

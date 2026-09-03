@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-02
+## [0.3.0] - 2026-09-03
 
 ### Added
 
@@ -23,22 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Arena::alloc_block`, whose exclusive `&mut self` receiver rules out a
   reentrant caller-side mutation.
 - `CheckpointError` and fail-closed `try_rollback`.
-- Cross-arena, stale-ABA, diverged-prefix, destructor-unwind, and concurrent
-  block checks.
-- `experimental-shared` feature boundary for `SharedArena`.
-- Public Criterion benchmarks for allocation, lookup, iteration, blocks,
-  rollback, reset, and experimental concurrent allocation.
-- A GitHub Actions benchmark workflow that compiles the harness on pull
-  requests and publishes reports, raw output, and a runner passport for full
-  runs.
-- A v0.2.1-to-v0.3.0 cross-version Criterion harness, alternating AB/BA raw
-  observations, and a diagnostic delta table, so the release exposes both
-  performance differences and the measured cost of stronger capability
-  validation on identical common-operation workloads without manufacturing a
-  paired confidence interval.
-- Amortized process-unique stamp allocation: globally disjoint ranges are
-  reserved atomically per participating thread and shared by its arenas,
-  without weakening foreign-arena or stale-ABA rejection.
 - `Arena::validate_checkpoint` and `SharedArena::validate_checkpoint`: check
   a checkpoint against the current arena state (foreign owner, length, and
   diverged-prefix tail stamp) without mutating the arena. A caller holding
@@ -47,17 +31,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rollback into an all-or-nothing operation with respect to
   `CheckpointError` — a panicking destructor in a discarded suffix can still
   interrupt an individual rollback.
+- Cross-arena, stale-ABA, diverged-prefix, destructor-unwind, and concurrent
+  block checks.
+- `experimental-shared` feature boundary for `SharedArena`.
+- Public Criterion benchmarks for allocation, lookup, iteration, blocks,
+  rollback, reset, and experimental concurrent allocation.
+- A GitHub Actions benchmark workflow that compiles the harness on pull
+  requests and publishes reports, raw output, and a runner passport for full
+  runs.
+- A v0.2.1-to-v0.3.0 cross-version Criterion harness, executable quality
+  witnesses that reproduce v0.2.1's rejected-capability gaps and confirm
+  their rejection here, alternating AB/BA raw observations, and a
+  diagnostic delta table, so the release exposes both performance
+  differences and the measured cost of stronger capability validation on
+  identical common-operation workloads without manufacturing a paired
+  confidence interval.
+- A layout guarantee test pinning `size_of::<Idx<u64>>()` and
+  `size_of::<Option<Idx<u64>>>()` at 16 bytes and `size_of::<Checkpoint<u64>>()`
+  at 24 bytes.
 
 ### Changed
 
-- `Arena::new` and `SharedArena::new` are no longer `const fn`. Both were
-  `pub const fn` in 0.2.1; constructing an arena now assigns it a
-  process-unique identity (an allocation stamp), which cannot be computed in
-  a `const` context.
-- `Arena<T>` keeps values contiguous while storing validation stamps in a
-  parallel metadata vector.
-- `Checkpoint<T>` now identifies an arena and a historical prefix rather than
+- **Capability model**: an arena no longer draws a fresh stamp for every
+  `alloc`/`alloc_block` call and stores it in a parallel per-slot vector.
+  Instead, each arena keeps one lazily assigned identity — a permanent birth
+  stamp, the stamp of the current *generation segment* (every allocation
+  since the last invalidating operation shares it), and a small table of
+  archived segments for slots an earlier `rollback`/`reset`/`drain` left
+  behind. A `rollback`, `reset`, or `drain` draws a fresh process-unique
+  stamp for the new segment and commits the boundary *before* dropping (or,
+  for `SharedArena`, taking) any value in the invalidated range, so a
+  destructor panic can never leave a not-yet-removed slot reporting a stamp
+  a stale `Idx` still carries. Validating a handle is one field comparison
+  in the common case instead of a parallel-vector index; a slot that
+  predates the current segment falls back to a binary search over the
+  (typically empty or tiny) archive table. The identity itself is assigned
+  lazily, on the first capability an arena issues (`alloc`, `alloc_block`,
+  or `checkpoint`), not in `new`/`with_capacity`.
+- `Arena::new` and `SharedArena::new` are `const fn` again: since identity
+  assignment is lazy, constructing an arena no longer needs a stamp, and a
+  `const` empty arena has no identity until its first capability.
+- `Checkpoint<T>` identifies an arena and a historical prefix rather than
   storing only a length.
+- `Arena::capacity` reports the backing value vector's capacity directly;
+  there is no longer a parallel metadata vector for it to reconcile against.
 - Concurrent batch allocation reserves its complete range atomically.
 - `SharedArena` documentation now distinguishes wait-free published reads from
   potentially waiting allocation.
@@ -70,6 +87,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more `baseline-candidate` pair than `candidate-baseline`), refuse
   zero-length intervals in the runner and the validator, and validate a
   two-repetition raw-pair file on pull requests.
+- Performance, measured against v0.2.1 with the paired alternating-order raw
+  protocol: allocation, iteration, and shared allocation are at parity, and so is
+  rollback on an arena that has already archived a segment. The first capability an arena issues (its first `alloc`,
+  `alloc_block` or `checkpoint`) allocates the arena's identity once, and its first rollback allocates
+  the archive table once; both are visible only on arenas that allocate a
+  few dozen values and are then discarded. Validated lookup pays the cost of one stamp comparison against
+  an inline mirror of the current segment stamp. `Arena` keeps the identity
+  itself (birth stamp, current stamp, current-start, archive table) behind
+  one lazily assigned `OnceLock<Box<Identity>>` sidecar, so it is not
+  allocated at all until the arena's first capability — but the sidecar
+  handle plus the inline mirror still cost a fixed handful of bytes on every
+  `Arena`, allocated or not, so an empty arena is larger than in 0.2.1 —
+  `size_of::<Arena<u64>>()` is 48 bytes versus 0.2.1's 24, and
+  `size_of::<SharedArena<u64>>()` is 1584 bytes versus 0.2.1's 784. Creating
+  many empty arenas is therefore measurably slower than 0.2.1, and the gap
+  widens with the number of arenas created rather than staying within a
+  fixed ratio. This is a diagnostic comparison on one host, not a portable
+  latency guarantee — see `benchmarks/release-comparison/QUALITY.md`.
 - `SharedArena::drain` now unpublishes and takes one slot at a time, from
   the last slot down to the first, decrementing `published`/`reserved`
   before each take, and panics if a currently published slot turns out to
@@ -99,6 +134,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves the arena immediately consistent: `len()` reports the correctly
   reduced count, `try_get` returns `None`, `iter` succeeds, and the arena
   stays usable for a retry.
+- A raw v0.2.1 slot index can accidentally read an equally numbered slot in
+  a foreign arena; 0.3.0 rejects the capability instead.
+- A v0.2.1 stale index left over after rollback and slot reuse retargets the
+  replacement value (the ABA problem); 0.3.0 rejects it while accepting the
+  fresh index.
+- A v0.2.1 checkpoint is only a length and can be applied to another arena;
+  0.3.0 returns `CheckpointError::ForeignArena` without changing the target.
+- A v0.2.1 `SharedArena::alloc_extend` reserves one slot per yielded item
+  through repeated `&self` calls to `alloc`, so a concurrent or reentrant
+  allocation between two yields can land inside the slot range the batch
+  occupies; 0.3.0's `SharedArena::alloc_block` reserves its whole range in
+  one atomic step, so the returned `Block` cannot be interleaved.
 
 ## [0.2.1] - 2026-02-23
 

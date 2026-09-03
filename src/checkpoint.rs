@@ -5,9 +5,26 @@ use crate::stamp::Stamp;
 /// Saved allocation prefix for validated rollback.
 ///
 /// Checkpoints can only be created by an arena. Besides the prefix length,
-/// they carry the arena identity and the stamp of the prefix tail. This rejects
-/// foreign checkpoints and the equal-length ABA case after a prefix was
-/// discarded and replaced.
+/// they carry the arena's permanent birth identity and the stamp of the
+/// generation segment that owned the prefix's tail slot at capture time.
+/// This rejects foreign checkpoints and the equal-length ABA case after a
+/// prefix was discarded and replaced.
+///
+/// `owner` is the arena's *birth* stamp — the one stamp assigned once, on
+/// the first capability the arena ever issues, and never touched again —
+/// not the segment stamp active at capture time (that is `tail`). Using the
+/// permanent identity here, rather than the live "current" stamp, is what
+/// lets a foreign *empty* checkpoint (`len == 0`) still be rejected as
+/// [`CheckpointError::ForeignArena`], and an *own* empty checkpoint captured
+/// after a `reset` still be accepted: both compare `owner` against the
+/// target arena's birth stamp, which a `reset` never changes, rather than
+/// against a `current` stamp that a `reset` always does change.
+///
+/// `tail` is `None` exactly when `len == 0` — an empty prefix has no tail
+/// slot to diverge, so an empty-prefix checkpoint always validates against
+/// any current state of its own arena. Because `Stamp` is a `NonZeroU64`,
+/// `Option<Stamp>` costs no extra space over `Stamp` itself: the compiler
+/// folds the discriminant into the niche `0` leaves unused.
 pub struct Checkpoint<T> {
     owner: Stamp,
     len: usize,

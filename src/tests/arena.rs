@@ -330,6 +330,71 @@ fn drain_returns_all_items() {
     assert!(arena.is_empty());
 }
 
+/// `drain` commits a fresh segment stamp before `Vec::drain` even runs (see
+/// `Self::drain`'s doc comment), so slots regrown to the exact pre-drain
+/// length belong to a new generation, not the old one: every pre-drain
+/// `Idx` is rejected, a pre-drain `Checkpoint` whose length no longer
+/// exceeds the regrown length is rejected as `DivergedPrefix` rather than
+/// wrongly validating, and only the freshly minted indices are valid.
+#[test]
+fn drain_then_regrowth_to_the_same_length_rejects_every_pre_drain_capability() {
+    let mut arena = Arena::new();
+    let old = [arena.alloc(1), arena.alloc(2), arena.alloc(3)];
+    let old_checkpoint = arena.checkpoint();
+
+    let drained: Vec<_> = arena.drain().collect();
+    assert_eq!(drained, vec![1, 2, 3]);
+
+    let new = [arena.alloc(10), arena.alloc(20), arena.alloc(30)];
+
+    assert_eq!(arena.len(), 3);
+    for idx in old {
+        assert!(!arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), None);
+    }
+    assert_eq!(
+        arena.validate_checkpoint(old_checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 3 })
+    );
+    for (idx, expected) in new.into_iter().zip([10, 20, 30]) {
+        assert!(arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), Some(&expected));
+    }
+}
+
+/// The same as
+/// `drain_then_regrowth_to_the_same_length_rejects_every_pre_drain_capability`,
+/// but the iterator `drain` returns is dropped without being consumed:
+/// `Vec::drain` already truncates the arena's value vector to length 0
+/// synchronously when `drain` is called, before this test ever drops the
+/// returned iterator, so the regrowth below observes the same empty arena
+/// either way.
+#[test]
+fn drain_dropped_without_consuming_still_regrows_under_a_new_generation() {
+    let mut arena = Arena::new();
+    let old = [arena.alloc(1), arena.alloc(2), arena.alloc(3)];
+    let old_checkpoint = arena.checkpoint();
+
+    drop(arena.drain());
+    assert_eq!(arena.len(), 0);
+
+    let new = [arena.alloc(10), arena.alloc(20), arena.alloc(30)];
+
+    assert_eq!(arena.len(), 3);
+    for idx in old {
+        assert!(!arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), None);
+    }
+    assert_eq!(
+        arena.validate_checkpoint(old_checkpoint),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 3 })
+    );
+    for (idx, expected) in new.into_iter().zip([10, 20, 30]) {
+        assert!(arena.is_valid(idx));
+        assert_eq!(arena.try_get(idx), Some(&expected));
+    }
+}
+
 #[test]
 fn drain_runs_no_extra_drops() {
     let drop_count = Rc::new(Cell::new(0u32));
@@ -553,6 +618,56 @@ fn equal_slots_from_different_arenas_do_not_alias() {
     assert_eq!(right.try_get(left_idx), None);
 }
 
+/// `Idx` carries a segment stamp and a slot, with no separate arena-owner
+/// field (see `crate::segments`). This is the "foreign `Idx` whose slot is
+/// in range" half of the argument for why that is still sound: `right` has
+/// an item at the same slot `left_idx` names, so the length check alone
+/// cannot reject it, and rejection depends entirely on `left_idx`'s stamp
+/// never matching any stamp `right` has ever drawn — which holds because
+/// every stamp is drawn from one process-wide sequence, not a per-arena one,
+/// so two independently created arenas can never coin the same stamp value.
+#[test]
+fn is_valid_rejects_foreign_idx_with_slot_in_range() {
+    let mut left = Arena::new();
+    let mut right = Arena::new();
+    for value in 0..8 {
+        left.alloc(value);
+        right.alloc(value + 100);
+    }
+    let left_idx = left.alloc(999);
+    let _right_padding = right.alloc(999);
+
+    assert_eq!(left_idx.slot(), 8);
+    assert!(
+        right.len() > left_idx.slot(),
+        "the slot is in range for `right`"
+    );
+    assert!(!right.is_valid(left_idx));
+    assert_eq!(right.try_get(left_idx), None);
+}
+
+/// The other half of the "no owner field" argument. An arena that has never
+/// issued a capability has no identity at all yet, so `is_valid` cannot even
+/// compare a stamp — but it also never needs to, because such an arena has
+/// zero items, and the length check `idx.slot() < self.items.len()` rejects
+/// every `Idx` before a stamp comparison would even be reached. This test
+/// also confirms `is_valid` itself never forces identity assignment (unlike
+/// `checkpoint`/`alloc`): a brand new, never-touched arena stays exactly
+/// that way after `is_valid` calls that return `false`.
+#[test]
+fn is_valid_rejects_any_idx_on_an_arena_that_never_issued_a_capability() {
+    let mut other = Arena::new();
+    let foreign_idx = other.alloc(1);
+
+    let never_touched: Arena<i32> = Arena::new();
+    assert!(!never_touched.is_valid(foreign_idx));
+    assert_eq!(never_touched.try_get(foreign_idx), None);
+    // Confirm the "never touched" premise itself, i.e. that this really
+    // exercises the never-assigned-identity path and not just an ordinary
+    // stale/foreign rejection on an otherwise-used arena.
+    assert!(never_touched.is_empty());
+}
+
 #[test]
 fn reset_and_reallocation_do_not_resurrect_an_old_index() {
     let mut arena = Arena::new();
@@ -697,11 +812,100 @@ fn rollback_keeps_metadata_aligned_when_a_destructor_panics() {
     assert!(result.is_err());
     assert_eq!(arena.len(), 2);
     assert!(!arena.is_valid(panicking_suffix));
-    assert!(arena.is_valid(first_suffix));
+    // The segment boundary commits before the drop loop runs, so
+    // `first_suffix` (slot >= the checkpoint's target length) is already
+    // rejected here even though its value has not been physically popped
+    // yet — see `crate::segments`'s module documentation.
+    assert!(!arena.is_valid(first_suffix));
 
     arena.rollback(checkpoint);
     assert_eq!(arena.len(), 1);
     assert!(!arena.is_valid(first_suffix));
+}
+
+/// Regression test for the ABA hole a commit-after-the-loop ordering would
+/// allow: without retrying an interrupted rollback to completion, a caller
+/// could `alloc` directly, reuse a not-yet-popped slot under the *old*
+/// generation, and have a stale pre-rollback `Idx` for that slot validate
+/// again against the new value. Committing the new segment boundary before
+/// the drop loop (rather than after it) closes this: every slot at or above
+/// the checkpoint's target length is rejected from the moment `rollback` is
+/// entered, whether or not its value has been physically popped, and
+/// whether or not the caller ever retries.
+#[test]
+fn rollback_without_retry_after_a_panic_on_the_second_dropped_slot_cannot_be_refilled_under_the_stale_generation()
+ {
+    struct PanicOnSecondDrop(Rc<Cell<u32>>);
+
+    impl Drop for PanicOnSecondDrop {
+        fn drop(&mut self) {
+            let count = self.0.get() + 1;
+            self.0.set(count);
+            assert_ne!(count, 2, "intentional destructor panic on the second drop");
+        }
+    }
+
+    let drop_count = Rc::new(Cell::new(0));
+    let mut arena: Arena<PanicOnSecondDrop> = Arena::new();
+    let _first = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count))); // slot 0, survives
+    let checkpoint = arena.checkpoint(); // target_len = 1
+    let stale_a = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count))); // slot 1, never popped
+    let stale_b = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count))); // slot 2, popped 2nd (panics)
+    let stale_c = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count))); // slot 3, popped 1st
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arena.rollback(checkpoint);
+    }));
+    assert!(
+        result.is_err(),
+        "the second dropped value's destructor panics"
+    );
+    assert_eq!(
+        drop_count.get(),
+        2,
+        "stale_c then stale_b are dropped before the panic surfaces"
+    );
+    assert_eq!(
+        arena.len(),
+        2,
+        "only stale_c and stale_b were popped before the panic; stale_a is untouched"
+    );
+
+    // Without retrying the rollback, allocate twice. These reuse the exact
+    // slots stale_b/stale_c used to name (2 and 3) — the historical bug —
+    // and stale_a's slot (1) is still sitting there completely untouched.
+    let refill_1 = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count)));
+    let refill_2 = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count)));
+    assert_eq!(refill_1.slot(), 2);
+    assert_eq!(refill_2.slot(), 3);
+
+    // Every pre-rollback `Idx` at or above the target length is rejected —
+    // including `stale_a`, whose slot was never physically popped, and
+    // `stale_b`/`stale_c`, whose slots were just refilled under a new
+    // generation neither of them carries.
+    assert!(!arena.is_valid(stale_a));
+    assert!(!arena.is_valid(stale_b));
+    assert!(!arena.is_valid(stale_c));
+    // A fresh `Idx` validates normally.
+    assert!(arena.is_valid(refill_1));
+    assert!(arena.is_valid(refill_2));
+
+    // The retry path still works: rolling back to the same checkpoint again
+    // converges to the target length — dropping the orphaned `stale_a`
+    // value and both refills — and a fresh allocation afterward validates.
+    arena.rollback(checkpoint);
+    assert_eq!(arena.len(), 1);
+    assert!(!arena.is_valid(refill_1));
+    assert!(!arena.is_valid(refill_2));
+    assert_eq!(
+        drop_count.get(),
+        5,
+        "stale_a and both refills are dropped by the retried rollback"
+    );
+
+    let after_retry = arena.alloc(PanicOnSecondDrop(Rc::clone(&drop_count)));
+    assert!(arena.is_valid(after_retry));
+    assert_eq!(after_retry.slot(), 1);
 }
 
 #[test]
@@ -741,7 +945,12 @@ fn reset_with_a_panicking_drop_keeps_alignment_and_is_retryable() {
         "last and panicking are dropped from the end before the panic surfaces"
     );
     assert_eq!(arena.len(), 1);
-    assert!(arena.is_valid(kept));
+    // `reset` always targets length 0, so its segment boundary commits
+    // before the drop loop covers *every* existing slot, including `kept`
+    // (not yet physically popped when `panicking`'s destructor fired).
+    // `kept` is therefore already rejected here, not just once its slot is
+    // later reused — see `crate::segments`'s module documentation.
+    assert!(!arena.is_valid(kept));
     assert!(!arena.is_valid(panicking));
     assert!(!arena.is_valid(last));
     assert_eq!(arena.iter_indexed().count(), 1);
@@ -906,18 +1115,6 @@ fn checkpoint_taken_before_drain_is_rejected_then_reported_as_diverged() {
         Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
     );
     assert_eq!(arena.len(), 2);
-}
-
-#[test]
-fn same_allocation_holds_only_within_one_alloc_or_alloc_block_call() {
-    let mut arena = Arena::new();
-    let x = arena.alloc(1);
-    let y = arena.alloc(2);
-    let block = arena.alloc_block([3, 4]);
-
-    assert!(!x.same_allocation(y));
-    assert!(block.get(0).unwrap().same_allocation(block.get(1).unwrap()));
-    assert!(!x.same_allocation(block.get(0).unwrap()));
 }
 
 #[test]
