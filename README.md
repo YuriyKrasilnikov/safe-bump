@@ -10,6 +10,41 @@ validated checkpoint rollback.
 
 The minimum supported Rust version is 1.96.
 
+## What 0.3.0 changes for a 0.2.1 user
+
+In 0.2.1 an index was a plain vector offset with a public constructor, and a
+checkpoint was a length. That is enough to read a value the handle was never
+issued for, without any error:
+
+```rust,ignore
+// safe-bump 0.2.1
+let mut arena = Arena::new();
+let old = arena.alloc(String::from("old"));
+arena.reset();
+arena.alloc(String::from("current"));
+
+assert_eq!(arena[old], "current");               // stale handle, no error
+assert_eq!(arena[Idx::from_raw(0)], "current");  // handle built from a number
+```
+
+and to empty one arena with a checkpoint that belongs to another:
+
+```rust,ignore
+// safe-bump 0.2.1
+let checkpoint = other.checkpoint();
+arena.rollback(checkpoint);                      // accepted; arena is emptied
+```
+
+0.3.0 answers `None` for the stale handle, `Err(CheckpointError::ForeignArena)`
+for the foreign checkpoint and `Err(CheckpointError::DivergedPrefix)` for a
+prefix that was discarded and rebuilt, and `Idx::from_raw` no longer exists,
+so a handle cannot be derived from a number at all. It also adds contiguous
+block capabilities, `drain`, and a `Send + Sync` experimental shared arena.
+
+These checks are the reason to upgrade and they are not free: see
+[Layout and cost](#layout-and-cost) for the sizes and [Benchmarks](#benchmarks)
+for the measured comparison against 0.2.1.
+
 ## Why the handles are capabilities
 
 A raw vector offset is not enough to identify an arena value. The same offset
@@ -184,23 +219,26 @@ cargo bench --locked --manifest-path benchmarks/release-comparison/Cargo.toml
 
 The release comparison covers allocation, validated lookup, sequential
 iteration, speculative rollback, and concurrent allocation. It deliberately
-does not pretend that v0.2 has equivalents for v0.3 block capabilities. In
-the paired alternating-order raw protocol, allocation, iteration, and shared allocation are at parity with v0.2.1, and
-so is rollback on an arena that has already archived a segment. The first capability an
-arena issues (its first `alloc`, `alloc_block` or `checkpoint`) allocates
-the arena's identity once, and its first rollback allocates the archive table
-once; both are visible only on arenas that allocate a few dozen values and are
-then discarded. Validated lookup pays the cost of
-one stamp comparison against an inline mirror of the current segment
-stamp. The identity itself (birth stamp, current stamp, current-start,
-archive table) is not allocated at all until an arena's first capability —
-but the lazily-assigned sidecar handle plus the inline mirror still cost a
-fixed handful of bytes on every arena, allocated or not, so an empty arena
-is larger than in 0.2.1 — `size_of::<Arena<u64>>()` is 48 bytes versus
-0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1584 bytes versus 0.2.1's
-784 — and creating many empty arenas is measurably slower than 0.2.1, with
-the gap widening with the number of arenas created rather than staying
-within a fixed ratio. A slower validated lookup or arena creation is not
+does not pretend that v0.2 has equivalents for v0.3 block capabilities. On the
+project's CI runner, measured in one run with two instruments — the paired
+alternating-order raw protocol and same-process Criterion medians — iteration
+and shared allocation stay at v0.2.1 levels (0.99x to 1.13x), and allocation
+costs about 1.2x to 1.4x. Validated lookup costs 1.10x to 1.21x by the
+Criterion estimate and 1.6x to 2.3x by the paired estimate on that same run:
+it pays for one stamp comparison against an inline mirror of the current
+segment stamp, which is what makes a stale handle answer `None` instead of a
+value. Speculative rollback costs about 1.2x to 1.4x for suffixes of 64 values
+and more, and for a suffix of one value it moves from about 2.5 ns to about
+29 ns, because 0.2.1 truncated a vector while 0.3.0 validates the checkpoint
+and opens a new generation segment. The identity itself (birth stamp, current
+stamp, current-start, archive table) is not allocated at all until an arena's
+first capability — but the lazily-assigned sidecar handle plus the inline
+mirror still cost a fixed handful of bytes on every arena, allocated or not,
+so an empty arena is larger than in 0.2.1 — `size_of::<Arena<u64>>()` is 48
+bytes versus 0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1584 bytes
+versus 0.2.1's 784 — and creating many empty arenas costs about 1.8x, with the
+gap widening with the number of arenas created rather than staying within a
+fixed ratio. A slower validated lookup or arena creation is not
 silently classified as a product regression: the report keeps each next to the
 stronger arena-identity and allocation-history checks that v0.2 did not
 perform. These are diagnostic comparisons on one host, not portable latency

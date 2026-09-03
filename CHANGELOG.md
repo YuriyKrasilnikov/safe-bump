@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0] - 2026-09-03
 
+This release is about what the arena refuses to do. In 0.2.1 a stale `Idx`
+read whatever value later occupied its slot, an `Idx` could be built from any
+number through `from_raw`, and `rollback` accepted any checkpoint short enough
+to fit, including one belonging to a different arena. 0.3.0 rejects all three,
+adds contiguous block capabilities and `drain`, and makes the experimental
+shared arena `Send + Sync`. The checks are paid for on validated reads, on
+arena creation and on short speculative rollbacks, and in the size of an empty
+arena; the measured picture is under "Changed".
+
 ### Added
 
 - Process-unique allocation stamps and arena identities.
@@ -87,24 +96,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more `baseline-candidate` pair than `candidate-baseline`), refuse
   zero-length intervals in the runner and the validator, and validate a
   two-repetition raw-pair file on pull requests.
-- Performance, measured against v0.2.1 with the paired alternating-order raw
-  protocol: allocation, iteration, and shared allocation are at parity, and so is
-  rollback on an arena that has already archived a segment. The first capability an arena issues (its first `alloc`,
-  `alloc_block` or `checkpoint`) allocates the arena's identity once, and its first rollback allocates
-  the archive table once; both are visible only on arenas that allocate a
-  few dozen values and are then discarded. Validated lookup pays the cost of one stamp comparison against
-  an inline mirror of the current segment stamp. `Arena` keeps the identity
-  itself (birth stamp, current stamp, current-start, archive table) behind
-  one lazily assigned `OnceLock<Box<Identity>>` sidecar, so it is not
-  allocated at all until the arena's first capability — but the sidecar
-  handle plus the inline mirror still cost a fixed handful of bytes on every
-  `Arena`, allocated or not, so an empty arena is larger than in 0.2.1 —
-  `size_of::<Arena<u64>>()` is 48 bytes versus 0.2.1's 24, and
-  `size_of::<SharedArena<u64>>()` is 1584 bytes versus 0.2.1's 784. Creating
-  many empty arenas is therefore measurably slower than 0.2.1, and the gap
-  widens with the number of arenas created rather than staying within a
-  fixed ratio. This is a diagnostic comparison on one host, not a portable
-  latency guarantee — see `benchmarks/release-comparison/QUALITY.md`.
+- Performance, measured against v0.2.1 on the project's CI runner with two
+  instruments in one run: the paired alternating-order raw protocol and
+  same-process Criterion medians. Iteration and shared allocation stay at
+  v0.2.1 levels (0.99x to 1.13x). Allocation costs about 1.2x to 1.4x.
+  Validated lookup costs 1.10x to 1.21x by the Criterion estimate and 1.6x to
+  2.3x by the paired estimate on that same run; it buys the check that a
+  handle still names the value it was issued for. Speculative rollback costs
+  about 1.2x to 1.4x for suffixes of 64 values and more, and for a suffix of
+  one value it moves from about 2.5 ns to about 29 ns, because v0.2.1
+  truncated a vector while v0.3.0 validates the checkpoint and opens a new
+  generation segment. `Arena` keeps its identity (birth stamp, current stamp,
+  current-start, archive table) behind one lazily assigned
+  `OnceLock<Box<Identity>>` sidecar, so it is not allocated at all until the
+  arena's first capability — but the sidecar handle plus the inline mirror
+  still cost a fixed handful of bytes on every `Arena`, allocated or not, so
+  an empty arena is larger than in 0.2.1 — `size_of::<Arena<u64>>()` is 48
+  bytes versus 0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1584 bytes
+  versus 0.2.1's 784. Creating many empty arenas costs about 1.8x, and the gap
+  widens with the number of arenas created rather than staying within a fixed
+  ratio. These are diagnostic comparisons on one host, not portable latency
+  guarantees — see `benchmarks/release-comparison/QUALITY.md`.
 - `SharedArena::drain` now unpublishes and takes one slot at a time, from
   the last slot down to the first, decrementing `published`/`reserved`
   before each take, and panics if a currently published slot turns out to
