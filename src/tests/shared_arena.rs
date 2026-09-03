@@ -262,6 +262,184 @@ fn validate_checkpoint_accepts_an_empty_arena_checkpoint_after_reset() {
     assert_eq!(arena.validate_checkpoint(empty_checkpoint), Ok(()));
 }
 
+/// `SharedArena` counterpart of
+/// `tests::arena::is_valid_agrees_with_a_brute_force_oracle_across_many_increasing_rollbacks`:
+/// builds several archived segments in `SharedIdentity` by repeatedly
+/// rolling back to a fresh checkpoint whose length exceeds the start of the
+/// segment just discarded — the O(1) "growing" branch of
+/// `crate::segments::SharedIdentity::commit`'s `prefix_tail` maintenance —
+/// then cross-checks `is_valid`, through the public surface only, against a
+/// brute-force oracle tracked independently of the arena's own bookkeeping.
+#[test]
+fn is_valid_agrees_with_a_brute_force_oracle_across_many_increasing_rollbacks() {
+    fn alloc_at(
+        arena: &SharedArena<usize>,
+        slot_epoch: &mut Vec<u64>,
+        handles: &mut Vec<(Idx<usize>, usize, u64)>,
+        epoch: u64,
+    ) {
+        let slot = arena.len();
+        let idx = arena.alloc(slot);
+        if slot < slot_epoch.len() {
+            slot_epoch[slot] = epoch;
+        } else {
+            slot_epoch.push(epoch);
+        }
+        handles.push((idx, slot, epoch));
+    }
+
+    let mut arena: SharedArena<usize> = SharedArena::new();
+    let mut slot_epoch: Vec<u64> = Vec::new();
+    let mut handles: Vec<(Idx<usize>, usize, u64)> = Vec::new();
+    let mut epoch: u64 = 0;
+
+    for _ in 0..6 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    let cp_at_6 = arena.checkpoint();
+    for _ in 0..9 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    assert_eq!(arena.len(), 15);
+
+    // First rollback: the very first commit this identity ever sees, so it
+    // archives nothing (the `SharedIdentity::commit` branch that leaves
+    // `prefix_tail` at `birth`).
+    arena.rollback(cp_at_6);
+    epoch += 1;
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    let cp_at_9 = arena.checkpoint();
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    assert_eq!(arena.len(), 12);
+
+    // Target (9) exceeds the segment just discarded's start (6): the O(1)
+    // growing branch, appending the table's first real entry.
+    arena.rollback(cp_at_9);
+    epoch += 1;
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    let cp_at_12 = arena.checkpoint();
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    assert_eq!(arena.len(), 15);
+
+    // Target (12) exceeds the previous start (9): a second table entry.
+    arena.rollback(cp_at_12);
+    epoch += 1;
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    let cp_at_15 = arena.checkpoint();
+    for _ in 0..3 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    assert_eq!(arena.len(), 18);
+
+    // Target (15) exceeds the previous start (12): a third table entry.
+    arena.rollback(cp_at_15);
+    epoch += 1;
+    for _ in 0..2 {
+        alloc_at(&arena, &mut slot_epoch, &mut handles, epoch);
+    }
+    assert_eq!(arena.len(), 17);
+
+    for (idx, slot, alloc_epoch) in &handles {
+        let current_owner = slot_epoch.get(*slot).copied();
+        let expected = *slot < arena.len() && current_owner == Some(*alloc_epoch);
+        assert_eq!(
+            arena.is_valid(*idx),
+            expected,
+            "slot {slot} allocated at epoch {alloc_epoch}, now owned by {current_owner:?}, \
+             current len {}",
+            arena.len()
+        );
+    }
+}
+
+/// `SharedArena` counterpart of
+/// `tests::arena::checkpoint_right_after_rollback_round_trips_then_detects_a_rebuilt_prefix`.
+/// A checkpoint captured immediately after a rollback lands exactly on the
+/// one slot `SharedIdentity::commit`'s `prefix_tail` cache exists for: it
+/// must still round-trip through `try_rollback`/`validate_checkpoint`, and
+/// once the prefix it names is later discarded and rebuilt under a fresh
+/// generation, the same checkpoint must be rejected as `DivergedPrefix`.
+#[test]
+fn checkpoint_right_after_rollback_round_trips_then_detects_a_rebuilt_prefix() {
+    let mut arena = SharedArena::new();
+    let a = arena.alloc(1);
+    let b = arena.alloc(2);
+    let mid = arena.checkpoint(); // len = 2
+    arena.alloc(3);
+    arena.alloc(4);
+
+    arena.rollback(mid); // -> len 2; current_start becomes 2
+
+    // Captured immediately after the rollback: `checkpoint()` asks for slot
+    // 1, which is `current_start - 1` — the `prefix_tail` fast path.
+    let just_after = arena.checkpoint();
+    assert_eq!(just_after.len(), 2);
+
+    assert_eq!(arena.validate_checkpoint(just_after), Ok(()));
+    arena.rollback(just_after); // no values to drop, but still commits a
+    // fresh generation for slot 1 (the non-growing, cold `prefix_tail`
+    // branch, since the target length does not exceed the prior start).
+    assert_eq!(arena.len(), 2);
+    assert_eq!(arena[a], 1);
+    assert_eq!(arena[b], 2);
+
+    // Discard and rebuild the prefix itself under a new generation.
+    arena.reset();
+    arena.alloc(10);
+    arena.alloc(20);
+    assert_eq!(arena.len(), 2);
+
+    assert_eq!(
+        arena.validate_checkpoint(just_after),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+    assert_eq!(
+        arena.try_rollback(just_after),
+        Err(CheckpointError::DivergedPrefix { checkpoint_len: 2 })
+    );
+}
+
+/// `SharedArena` counterpart of
+/// `tests::arena::checkpoint_after_reset_and_after_drain_are_both_empty_and_valid`.
+/// `commit(0)` (via `reset` and via `drain`) followed immediately by a
+/// `checkpoint`: `checkpoint()` computes `len.checked_sub(1)`, which is
+/// `None` at `len == 0`, so it never reads `prefix_tail` at all.
+#[test]
+fn checkpoint_after_reset_and_after_drain_are_both_empty_and_valid() {
+    let mut arena = SharedArena::new();
+    arena.alloc(1);
+    arena.alloc(2);
+    arena.reset();
+    let after_reset = arena.checkpoint();
+    assert_eq!(after_reset.len(), 0);
+    assert!(after_reset.tail().is_none());
+    assert_eq!(arena.validate_checkpoint(after_reset), Ok(()));
+    arena.rollback(after_reset);
+    assert_eq!(arena.len(), 0);
+
+    arena.alloc(10);
+    arena.alloc(20);
+    arena.alloc(30);
+    let drained: Vec<_> = arena.drain().collect();
+    assert_eq!(drained, vec![10, 20, 30]);
+    let after_drain = arena.checkpoint();
+    assert_eq!(after_drain.len(), 0);
+    assert!(after_drain.tail().is_none());
+    assert_eq!(arena.validate_checkpoint(after_drain), Ok(()));
+    arena.rollback(after_drain);
+    assert_eq!(arena.len(), 0);
+}
+
 #[test]
 fn reset_preserves_drop_exactly_once() {
     let drops = Rc::new(Cell::new(0));

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A checkpoint taken with no allocation since the last `rollback`, `reset`
+  or `drain` read the slot below the current segment through a binary
+  search over the archived segments, so its cost grew with the number of
+  those segments. The identity now caches that one stamp, and the search
+  is left to handles that reach further back.
+
+### Changed
+
+- `size_of::<SharedArena<u64>>()` is 1592 bytes, up from 1584, because the
+  identity `SharedArena` embeds carries the cached stamp.
+  `size_of::<Arena<u64>>()` is unchanged at 48 bytes: its identity lives
+  behind a pointer.
+
 ## [0.3.0] - 2026-09-03
 
 This release is about what the arena refuses to do. In 0.2.1 a stale `Idx`

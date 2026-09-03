@@ -152,7 +152,7 @@ uniqueness after arenas or threads are dropped.
 | `alloc` | O(1) amortized |
 | `alloc_block(n)` | O(n) |
 | `get`, `try_get`, indexing, `is_valid` | O(1) for a handle of the current segment, O(log s) for one that predates it |
-| `checkpoint` | O(1), O(log s) when taken with no allocation since the last rollback |
+| `checkpoint` | O(1) |
 | `rollback(k)` | O(k), including destructors |
 | `reset(n)`, `drain(n)` | O(n) |
 
@@ -163,7 +163,9 @@ rolls back to the same length keeps `s` at one, because committing a segment
 drops the archived entries that start at or after the new boundary. `s` grows
 only when an arena rolls back to a strictly increasing length again and
 again, as a backtracking parser does; validating a handle issued before those
-rollbacks then costs a binary search over the archive.
+rollbacks then costs a binary search over the archive; the one slot
+directly below the current segment, which is what `checkpoint` reads, is
+cached and does not search.
 
 ## Experimental concurrent arena
 
@@ -244,7 +246,7 @@ stamp, current-start, archive table) is not allocated at all until an arena's
 first capability — but the lazily-assigned sidecar handle plus the inline
 mirror still cost a fixed handful of bytes on every arena, allocated or not,
 so an empty arena is larger than in 0.2.1 — `size_of::<Arena<u64>>()` is 48
-bytes versus 0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1584 bytes
+bytes versus 0.2.1's 24, and `size_of::<SharedArena<u64>>()` is 1592 bytes
 versus 0.2.1's 784 — and creating many empty arenas costs about 1.8x, with the
 gap widening with the number of arenas created rather than staying within a
 fixed ratio. A slower validated lookup or arena creation is not

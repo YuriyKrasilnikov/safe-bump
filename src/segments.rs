@@ -115,6 +115,14 @@ pub struct Identity {
     birth: Stamp,
     current: Stamp,
     current_start: usize,
+    /// Stamp covering slot `current_start - 1` — the slot immediately below
+    /// the current segment. Meaningful only when `current_start > 0`;
+    /// maintained by [`commit`](Self::commit) so [`stamp_of`](Self::stamp_of)
+    /// can answer that one slot in O(1) instead of falling into
+    /// [`stamp_of_cold`](Self::stamp_of_cold)'s binary search — which is
+    /// exactly the slot `checkpoint`/`validate_checkpoint` ask about right
+    /// after a `rollback`/`reset`/`drain`.
+    prefix_tail: Stamp,
     table: Vec<(usize, Stamp)>,
 }
 
@@ -126,6 +134,9 @@ impl Identity {
             birth: stamp,
             current: stamp,
             current_start: 0,
+            // Not yet meaningful: `current_start == 0`, so `stamp_of` never
+            // reads this before the first `commit`.
+            prefix_tail: stamp,
             table: Vec::new(),
         }
     }
@@ -148,6 +159,13 @@ impl Identity {
     pub(crate) fn stamp_of(&self, slot: usize) -> Stamp {
         if slot >= self.current_start {
             self.current
+        } else if slot + 1 == self.current_start {
+            // The one slot immediately below the current segment: answered
+            // from the cached `prefix_tail` instead of `stamp_of_cold`'s
+            // binary search. `current_start > 0` is implied here (the first
+            // branch above already covers every slot when it is `0`), so
+            // `prefix_tail` is guaranteed meaningful.
+            self.prefix_tail
         } else {
             self.stamp_of_cold(slot)
         }
@@ -186,6 +204,7 @@ impl Identity {
     /// operation (a retried invalidating call) is safe: compaction keeps the
     /// table from growing without bound.
     pub(crate) fn commit(&mut self, new_len: usize) {
+        let old_start = self.current_start;
         // Archive the segment that has been "current" so far, unless it is
         // still the birth segment (no commit has happened on this identity
         // yet), which is never itself archived — the cold path's fallback
@@ -193,15 +212,52 @@ impl Identity {
         // heuristic: stamps are drawn from a process-wide sequence that
         // never repeats a value, so `current` can equal `birth` only while
         // literally still holding the value it was created with.
-        if self.current != self.birth {
+        let old_current = (self.current != self.birth).then_some(self.current);
+        if let Some(old_current) = old_current {
             let dead_from = self
                 .table
                 .partition_point(|(start, _)| *start < self.current_start);
             self.table.truncate(dead_from);
-            self.table.push((self.current_start, self.current));
+            self.table.push((self.current_start, old_current));
         }
         self.current = Stamp::fresh();
         self.current_start = new_len;
+
+        // Keep `prefix_tail` — the stamp covering slot `new_len - 1`, the
+        // slot immediately below the new current segment — an O(1) cache of
+        // what `stamp_of(new_len - 1)` would return.
+        self.prefix_tail = match old_current {
+            // `new_len == 0`: slot `new_len - 1` does not exist, and
+            // `stamp_of`/`checkpoint` never read `prefix_tail` while
+            // `current_start == 0`. Leave the field as-is; there is nothing
+            // cheaper than not computing it at all.
+            _ if new_len == 0 => self.prefix_tail,
+            // Slot `new_len - 1 >= old_start` falls inside the segment just
+            // archived above as `(old_start, old_current)`: that entry is
+            // now its covering one, so the answer is already in hand. This
+            // is also the only way the table ever *grows*: each commit that
+            // extends it targets a `new_len` strictly past the segment it
+            // just archived, which is exactly this branch — a commit that
+            // instead reaches back past `old_start` (the next branch) never
+            // adds a new distinct entry, it can only get compacted away.
+            Some(old_current) if new_len > old_start => old_current,
+            // `new_len <= old_start`: this commit reaches back past the
+            // segment just archived, into one that was already historical
+            // before this call. The entry just pushed cannot cover slot
+            // `new_len - 1` (its `start` is `old_start`, which is `>
+            // new_len - 1` here), so there is no O(1) answer available —
+            // fall back to the same search `stamp_of_cold` uses. `table`
+            // already reflects this call's archiving, but that is harmless:
+            // the pushed entry is never the one the search selects.
+            Some(_) => self.stamp_of_cold(new_len - 1),
+            // `old_current` is `None`: `current` still equalled `birth` on
+            // entry, so this is the very first commit this identity has
+            // ever seen (see the comment above `old_current`'s definition).
+            // Nothing is archived yet, and slot `new_len - 1` (which exists
+            // because `new_len > 0` here) was allocated before this call,
+            // i.e. under `birth`.
+            None => self.birth,
+        };
     }
 }
 
@@ -222,6 +278,15 @@ pub struct SharedIdentity {
     birth: AtomicU64,
     current: AtomicU64,
     current_start: usize,
+    /// Stamp covering slot `current_start - 1`, the slot immediately below
+    /// the current segment. Meaningful only when `current_start > 0`; like
+    /// `current_start` and `table`, it is only ever written by the `&mut
+    /// self` operations (see the struct doc comment), so no synchronization
+    /// is needed for it either. Maintained by [`commit`](Self::commit) so
+    /// [`stamp_of`](Self::stamp_of) can answer that one slot in O(1) instead
+    /// of falling into [`stamp_of_cold`](Self::stamp_of_cold)'s binary
+    /// search.
+    prefix_tail: Stamp,
     #[allow(clippy::box_collection)]
     table: Option<Box<Vec<(usize, Stamp)>>>,
 }
@@ -233,6 +298,10 @@ impl SharedIdentity {
             birth: AtomicU64::new(0),
             current: AtomicU64::new(0),
             current_start: 0,
+            // Not yet meaningful (`current_start == 0`, `birth`/`current`
+            // themselves still unassigned); any nonzero value works as the
+            // placeholder since nothing reads it before the first `commit`.
+            prefix_tail: Stamp::from_nonzero(std::num::NonZeroU64::MIN),
             table: None,
         }
     }
@@ -300,6 +369,10 @@ impl SharedIdentity {
     pub(crate) fn stamp_of(&self, slot: usize) -> Stamp {
         if slot >= self.current_start {
             self.current()
+        } else if slot + 1 == self.current_start {
+            // See `Identity::stamp_of`'s companion comment: `current_start >
+            // 0` is implied here, so `prefix_tail` is guaranteed meaningful.
+            self.prefix_tail
         } else {
             self.stamp_of_cold(slot)
         }
@@ -334,8 +407,8 @@ impl SharedIdentity {
     }
 
     /// Commits a new segment boundary. See [`Identity::commit`] for the
-    /// ordering contract and the compaction rule; both apply identically
-    /// here.
+    /// ordering contract, the compaction rule, and the `prefix_tail`
+    /// branches; all apply identically here.
     pub(crate) fn commit(&mut self, new_len: usize) {
         let birth_raw = self.birth_raw();
         if birth_raw == 0 {
@@ -345,18 +418,30 @@ impl SharedIdentity {
             // stamps here would only waste them.
             return;
         }
+        let old_start = self.current_start;
         let current_raw = self.current_raw();
-        if current_raw != birth_raw {
-            let current = Stamp::from_nonzero(
+        let old_current = (current_raw != birth_raw).then(|| {
+            Stamp::from_nonzero(
                 std::num::NonZeroU64::new(current_raw)
                     .expect("a non-birth current stamp is never the unassigned sentinel"),
-            );
+            )
+        });
+        if let Some(old_current) = old_current {
             let table = self.table.get_or_insert_with(|| Box::new(Vec::new()));
             let dead_from = table.partition_point(|(start, _)| *start < self.current_start);
             table.truncate(dead_from);
-            table.push((self.current_start, current));
+            table.push((self.current_start, old_current));
         }
         self.current.store(Stamp::fresh().get(), Ordering::Relaxed);
         self.current_start = new_len;
+
+        // See `Identity::commit`'s matching `match` for the rationale behind
+        // each branch below.
+        self.prefix_tail = match old_current {
+            _ if new_len == 0 => self.prefix_tail,
+            Some(old_current) if new_len > old_start => old_current,
+            Some(_) => self.stamp_of_cold(new_len - 1),
+            None => self.birth(),
+        };
     }
 }
