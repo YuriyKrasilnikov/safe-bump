@@ -415,7 +415,7 @@ checksum = "031ac0abb11387b0c05b911412b63881cdb6f7db9b8952b7ee515d21fd3b175a"
 
 [[package]]
 name = "safe-bump"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "safe-bump-release-comparison"
@@ -423,7 +423,7 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "safe-bump 0.2.1",
- "safe-bump 0.3.0",
+ "safe-bump 0.3.1",
 ]
 
 [[package]]

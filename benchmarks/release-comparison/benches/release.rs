@@ -28,7 +28,7 @@ fn allocation(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("v0.3.0", size), &size, |b, &size| {
+        group.bench_with_input(BenchmarkId::new("v0.3.1", size), &size, |b, &size| {
             b.iter(|| {
                 let mut arena = CurrentArena::with_capacity(size);
                 for value in 0..size {
@@ -66,7 +66,7 @@ fn validated_lookup(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("v0.3.0", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("v0.3.1", size), &size, |b, _| {
             b.iter(|| {
                 let checksum = black_box(current_indices.as_slice())
                     .iter()
@@ -92,7 +92,7 @@ fn iteration(c: &mut Criterion) {
             b.iter(|| black_box(previous.iter().copied().fold(0_u64, u64::wrapping_add)));
         });
 
-        group.bench_with_input(BenchmarkId::new("v0.3.0", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("v0.3.1", size), &size, |b, _| {
             b.iter(|| black_box(current.iter().copied().fold(0_u64, u64::wrapping_add)));
         });
     }
@@ -124,7 +124,7 @@ fn speculative_rollback(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("v0.3.0", suffix_len),
+            BenchmarkId::new("v0.3.1", suffix_len),
             &suffix_len,
             |b, _| {
                 b.iter(|| {
@@ -172,7 +172,7 @@ fn concurrent_allocation(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("v0.3.0", thread_count),
+            BenchmarkId::new("v0.3.1", thread_count),
             &thread_count,
             |b, &thread_count| {
                 b.iter(|| {

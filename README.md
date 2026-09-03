@@ -194,7 +194,7 @@ cached and does not search.
 `SharedArena<T>` is available only with the `experimental-shared` feature:
 
 ```toml
-safe-bump = { version = "0.3.0", features = ["experimental-shared"] }
+safe-bump = { version = "0.3.1", features = ["experimental-shared"] }
 ```
 
 It reserves a whole batch with one atomic transition, so concurrent batches

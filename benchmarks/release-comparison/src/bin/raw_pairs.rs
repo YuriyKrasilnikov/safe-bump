@@ -11,7 +11,7 @@ const WARMUPS: usize = 2;
 const DEFAULT_REPETITIONS: usize = 15;
 const TOTAL_SHARED_ITEMS: usize = 65_536;
 const BASELINE_LABEL: &str = "v0.2.1";
-const CANDIDATE_LABEL: &str = "v0.3.0";
+const CANDIDATE_LABEL: &str = "v0.3.1";
 
 #[derive(Clone, Copy)]
 struct Observation {

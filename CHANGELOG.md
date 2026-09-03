@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-03
+
 ### Fixed
 
 - A checkpoint taken with no allocation since the last `rollback`, `reset`
@@ -17,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The README opens with the crate comparison again; the 0.3.0 rewrite had
+  dropped the table that 0.2.1 published.
 - `size_of::<SharedArena<u64>>()` is 1592 bytes, up from 1584, because the
   identity `SharedArena` embeds carries the cached stamp.
   `size_of::<Arena<u64>>()` is unchanged at 48 bytes: its identity lives
