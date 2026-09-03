@@ -18,9 +18,9 @@ include = [
     "/NOTICE",
     "/Cargo.toml",
 ]
-description = "Safe typed arena with unforgeable indices, contiguous allocation blocks, and validated rollback"
+description = "Safe typed arena with unforgeable indices, contiguous blocks and validated rollback, no unsafe code"
 categories = ["memory-management", "data-structures"]
-keywords = ["arena", "allocator", "bump", "memory", "safe"]
+keywords = ["arena", "allocator", "rollback", "checkpoint", "bump"]
 
 [package.metadata.docs.rs]
 all-features = true

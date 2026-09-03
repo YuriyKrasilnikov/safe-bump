@@ -280,4 +280,4 @@ identity or allowing wraparound. Stamp exhaustion also fails before reuse.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/YuriyKrasilnikov/safe-bump/blob/main/LICENSE).
