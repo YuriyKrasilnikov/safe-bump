@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The README reports the one-value speculative rollback as the two workflow
+  runs of the 0.3 line measured it, 12 ns and 29 ns against 0.2.1's 2.5 ns,
+  instead of the single figure one run produced.
 - The README opens with the crate comparison again; the 0.3.0 rewrite had
   dropped the table that 0.2.1 published.
 - `size_of::<SharedArena<u64>>()` is 1592 bytes, up from 1584, because the

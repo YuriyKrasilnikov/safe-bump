@@ -261,9 +261,11 @@ Criterion estimate and 1.6x to 2.3x by the paired estimate on that same run:
 it pays for one stamp comparison against an inline mirror of the current
 segment stamp, which is what makes a stale handle answer `None` instead of a
 value. Speculative rollback costs about 1.2x to 1.4x for suffixes of 64 values
-and more, and for a suffix of one value it moves from about 2.5 ns to about
-29 ns, because 0.2.1 truncated a vector while 0.3.0 validates the checkpoint
-and opens a new generation segment. The identity itself (birth stamp, current
+and more. For a suffix of one value the workload is a few nanoseconds long
+and the two workflow runs of the 0.3 line disagree, reporting 12 ns and
+29 ns against 0.2.1's 2.5 ns; read the direction, not the figure. 0.2.1
+truncated a vector there, while 0.3 validates the checkpoint and opens a
+new generation segment. The identity itself (birth stamp, current
 stamp, current-start, archive table) is not allocated at all until an arena's
 first capability — but the lazily-assigned sidecar handle plus the inline
 mirror still cost a fixed handful of bytes on every arena, allocated or not,
