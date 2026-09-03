@@ -151,10 +151,19 @@ uniqueness after arenas or threads are dropped.
 |---|---|
 | `alloc` | O(1) amortized |
 | `alloc_block(n)` | O(n) |
-| `get`, `try_get`, indexing | O(1) |
-| `checkpoint` | O(1) |
+| `get`, `try_get`, indexing, `is_valid` | O(1) for a handle of the current segment, O(log s) for one that predates it |
+| `checkpoint` | O(1), O(log s) when taken with no allocation since the last rollback |
 | `rollback(k)` | O(k), including destructors |
 | `reset(n)`, `drain(n)` | O(n) |
+
+Here `s` is the number of archived segments the arena still distinguishes.
+An arena that never rolls back, resets or drains keeps `s` at zero and
+answers every validation with one stamp comparison. A speculative loop that
+rolls back to the same length keeps `s` at one, because committing a segment
+drops the archived entries that start at or after the new boundary. `s` grows
+only when an arena rolls back to a strictly increasing length again and
+again, as a backtracking parser does; validating a handle issued before those
+rollbacks then costs a binary search over the archive.
 
 ## Experimental concurrent arena
 
