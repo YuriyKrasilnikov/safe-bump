@@ -10,6 +10,28 @@ validated checkpoint rollback.
 
 The minimum supported Rust version is 1.96.
 
+## Why safe-bump?
+
+| Feature | `safe-bump` | `bumpalo` | `typed-arena` | `bump-scope` |
+|---------|------------|-----------|---------------|-------------|
+| `unsafe` code | **none** | yes | yes | yes |
+| `#![forbid(unsafe_code)]` | **yes** | no | no | no |
+| Auto `Drop` | **yes** | no | yes | yes (`BumpBox`) |
+| Rollback to a saved point | **yes, safe** | no | no | yes, `reset_to` is `unsafe` |
+| Keep a prefix, discard the rest | **yes** | discard all | neither | yes, through `reset_to` |
+| Handle is a value, not a borrow | **`Idx<T>`, `Copy`** | `&T` | `&mut T` | `BumpBox` |
+| Stale handle after rollback | **rejected** | no rollback | no rollback | caller's obligation |
+| Parallel allocation | **`SharedArena`** | no | no | `BumpPool` |
+| Access returns `&T` | **yes** | yes | yes | after `into_ref` |
+
+Existing arena allocators rely on `unsafe` internally for pointer
+manipulation. `safe-bump` achieves the same arena semantics using only safe
+Rust, hands out a `Copy` handle that can be stored in a data structure
+instead of a borrow tied to the arena's lifetime, and rejects a handle whose
+value a rollback has discarded instead of leaving that obligation to the
+caller. The other columns were read from `bumpalo` 3.20.3, `typed-arena`
+2.0.2 and `bump-scope` 0.16.5.
+
 ## What 0.3.0 changes for a 0.2.1 user
 
 In 0.2.1 an index was a plain vector offset with a public constructor, and a
